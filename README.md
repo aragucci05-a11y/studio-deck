@@ -35,8 +35,14 @@ cargo build --release        # -> target/release/studiodeck.exe
 **background mode** — `studiodeck.exe --background on|off`, or the window's system menu (title-bar icon /
 Alt+Space) → *Run in background*. With it on, `studiodeck.exe` waits invisibly (no tray icon) and appears while 2+
 Studios are open; turning it off quits it within a second. Optional autostart: `--install` (also turns background
-on; `--uninstall` turns both off).
+on; `--uninstall` turns both off). `--show-when <n>` sets how many open Studios make it appear (default 2;
+`1` = whenever Studio is open).
 Quit: `taskkill /im studiodeck.exe`.
+
+## For AI agents
+
+Point your agent at [AGENTS.md](AGENTS.md) (Claude Code, Cursor and Codex read it automatically when it's in the
+workspace; otherwise add one line to your agent's global instructions telling it to follow it).
 
 ## Report agent status
 

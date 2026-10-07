@@ -267,7 +267,8 @@ impl App {
         if !self.force && !background_enabled() { unsafe { PostQuitMessage(0) }; return }
         let found = find_studios();
         auto_no_hung_plugin(&found);
-        let want = if self.force { true } else if found.len() < 2 { self.dismissed = false; false } else { !self.dismissed };
+        let min = min_studios();
+        let want = if self.force { true } else if found.len() < min { self.dismissed = false; false } else { !self.dismissed };
         if want != self.visible { self.set_visible(want) }
         if !self.visible { return }
         self.status.refresh();
@@ -567,6 +568,14 @@ fn set_background(on: bool) -> Result<(), String> {
     std::fs::write(settings_path(), v.to_string()).map_err(|e| e.to_string())
 }
 const SC_BACKGROUND: usize = 0x1010;
+// background mode shows the deck while at least this many Studios are open (setting "showWhen", default 2)
+fn min_studios() -> usize { read_settings().get("showWhen").and_then(|n| n.as_u64()).map(|n| n.clamp(1, 9) as usize).unwrap_or(2) }
+fn set_show_when(arg: Option<&String>) -> Result<(), String> {
+    let n: u64 = arg.and_then(|a| a.parse().ok()).filter(|n| (1..=9).contains(n)).ok_or("usage: --show-when <1-9>")?;
+    let mut v = read_settings();
+    v["showWhen"] = n.into();
+    std::fs::write(settings_path(), v.to_string()).map_err(|e| e.to_string())
+}
 
 // Saved rect if it is still on a monitor, else 70% of the primary work area, centred.
 fn initial_rect(v: &serde_json::Value) -> RECT {
@@ -676,6 +685,7 @@ fn main() {
         Some("--status") => Some(write_status(&args[2..])),
         Some("--install") => Some(set_background(true).and_then(|_| install(true))),
         Some("--uninstall") => Some(set_background(false).and_then(|_| install(false))),
+        Some("--show-when") => Some(set_show_when(args.get(2))),
         Some("--background") => Some(match args.get(2).map(String::as_str) {
             Some("on") => set_background(true),
             Some("off") => set_background(false),
