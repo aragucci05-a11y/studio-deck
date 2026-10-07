@@ -264,6 +264,7 @@ impl App {
     fn dragging(&self) -> Option<HWND> { self.drag.as_ref().filter(|d| d.moved).map(|d| d.src) }
 
     fn tick(&mut self) {
+        if !self.force && !background_enabled() { unsafe { PostQuitMessage(0) }; return }
         let found = find_studios();
         auto_no_hung_plugin(&found);
         let want = if self.force { true } else if found.len() < 2 { self.dismissed = false; false } else { !self.dismissed };
@@ -477,6 +478,7 @@ impl App {
                 for (k, v) in [("x", r.left), ("y", r.top), ("w", r.right - r.left), ("h", r.bottom - r.top)] { self.settings[k] = v.into() }
             }
         }
+        self.settings["background"] = background_enabled().into(); // (toggled elsewhere: never overwrite it)
         let _ = std::fs::write(settings_path(), self.settings.to_string());
     }
 
@@ -552,6 +554,19 @@ impl App {
 // ---------- settings (window rect + tile order) ----------
 
 fn settings_path() -> PathBuf { PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("studiodeck.json") }
+fn read_settings() -> serde_json::Value {
+    std::fs::read_to_string(settings_path()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .filter(|v| v.is_object()).unwrap_or_else(|| serde_json::json!({}))
+}
+// BACKGROUND toggle (default OFF): when off, studiodeck.exe without --show exits at once and a running background
+// instance quits within a second - nothing resident, no tray. On: `--background on`, the window's system menu, or --install.
+fn background_enabled() -> bool { read_settings().get("background").and_then(|b| b.as_bool()).unwrap_or(false) }
+fn set_background(on: bool) -> Result<(), String> {
+    let mut v = read_settings();
+    v["background"] = on.into();
+    std::fs::write(settings_path(), v.to_string()).map_err(|e| e.to_string())
+}
+const SC_BACKGROUND: usize = 0x1010;
 
 // Saved rect if it is still on a monitor, else 70% of the primary work area, centred.
 fn initial_rect(v: &serde_json::Value) -> RECT {
@@ -625,6 +640,12 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 if a.force { a.save_settings(); DestroyWindow(h); } else { a.dismissed = true; a.set_visible(false); }
                 0
             }
+            WM_SYSCOMMAND if (wp & 0xFFF0) == SC_BACKGROUND => {
+                let on = !background_enabled();
+                let _ = set_background(on);
+                CheckMenuItem(GetSystemMenu(h, 0), SC_BACKGROUND as u32, if on { MF_CHECKED } else { MF_UNCHECKED });
+                0
+            }
             WM_DESTROY => { PostQuitMessage(0); 0 }
             _ => DefWindowProcW(h, msg, wp, lp),
         }
@@ -653,8 +674,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cli = match args.get(1).map(String::as_str) {
         Some("--status") => Some(write_status(&args[2..])),
-        Some("--install") => Some(install(true)),
-        Some("--uninstall") => Some(install(false)),
+        Some("--install") => Some(set_background(true).and_then(|_| install(true))),
+        Some("--uninstall") => Some(set_background(false).and_then(|_| install(false))),
+        Some("--background") => Some(match args.get(2).map(String::as_str) {
+            Some("on") => set_background(true),
+            Some("off") => set_background(false),
+            _ => Err("usage: --background on|off".into()),
+        }),
         Some(c @ ("--shot" | "--click" | "--key" | "--scroll")) => Some(remote::run(c, &args[2..])),
         _ => None,
     };
@@ -663,6 +689,7 @@ fn main() {
         return;
     }
     let force = args.iter().any(|a| a == "--show");
+    if !force && !background_enabled() { return } // fully off unless the background toggle is on
     unsafe {
         let name = w("Local\\studiodeck-single-instance");
         let _mutex = CreateMutexW(null(), 0, name.as_ptr());
@@ -698,6 +725,11 @@ fn main() {
             card: (0.0, 0.0), slots: Vec::new(), drag: None, animating: false, last_frame: Instant::now(), settings,
         });
         APP.set(Box::into_raw(boxed));
+        // system-menu toggle (title-bar icon / Alt+Space): "Run in background"
+        let sm = GetSystemMenu(hwnd, 0);
+        let label = w("Run in background (auto-show with 2+ Studios)");
+        AppendMenuW(sm, MF_SEPARATOR, 0, null());
+        AppendMenuW(sm, MF_STRING | if background_enabled() { MF_CHECKED } else { MF_UNCHECKED }, SC_BACKGROUND, label.as_ptr());
         app().make_fonts();
         app().tick();
         SetTimer(hwnd, POLL_TIMER, 1000, None);
