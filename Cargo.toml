@@ -1,0 +1,32 @@
+[package]
+name = "studiodeck"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+png = "0.18.1"
+serde_json = "1"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_System_Threading",
+  "Win32_System_ProcessStatus",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Registry",
+  "Win32_Security",
+  "Win32_Storage_Xps",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[build-dependencies]
+embed-resource = "3"
