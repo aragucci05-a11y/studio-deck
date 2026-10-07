@@ -56,7 +56,7 @@ impl Status {
     // Re-parses a file only when its modified time changed.
     fn refresh(&mut self) {
         let _ = std::fs::create_dir_all(status_dir());
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(status_dir()).into_iter().flatten().flatten()
+        let paths: Vec<PathBuf> = std::fs::read_dir(status_dir()).into_iter().flatten().flatten()
             .map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
         let mut next = HashMap::new();
         for p in paths {
