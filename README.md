@@ -14,7 +14,8 @@ calm window.
   capture, ~0% CPU).
 - **Agent status under each tile.** Place name, RAM, a status dot and the current task, written by your agents
   (Claude Code, Cursor, Codex, scripts…) with one silent command.
-- **Shows up only when needed.** Runs in the background and appears while 2+ Studios are open; hides otherwise.
+- **Off unless you want it.** Opens with `--show`; optional background mode (a toggle, default off) waits invisibly
+  and appears while 2+ Studios are open — no tray icon, nothing resident when off.
 - **iPhone-style tiles.** Drag to reorder with spring animations; click to bring that Studio forward.
 - **Focus-free control.** Screenshot a covered Studio window, click, type and scroll in it — without moving your
   cursor or changing the foreground window. Several agents can work in several Studios in parallel.
@@ -30,8 +31,11 @@ Download `studiodeck.exe` from [Releases](../../releases), or build it:
 cargo build --release        # -> target/release/studiodeck.exe
 ```
 
-Run `studiodeck.exe` (background mode) or `studiodeck.exe --show` to open the window now.
-Optional autostart: `studiodeck.exe --install` (HKCU Run entry; `--uninstall` removes it).
+`studiodeck.exe --show` opens the window (closing it quits). Nothing stays resident unless you turn on
+**background mode** — `studiodeck.exe --background on|off`, or the window's system menu (title-bar icon /
+Alt+Space) → *Run in background*. With it on, `studiodeck.exe` waits invisibly (no tray icon) and appears while 2+
+Studios are open; turning it off quits it within a second. Optional autostart: `--install` (also turns background
+on; `--uninstall` turns both off).
 Quit: `taskkill /im studiodeck.exe`.
 
 ## Report agent status
