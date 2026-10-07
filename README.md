@@ -18,6 +18,8 @@ calm window.
 - **iPhone-style tiles.** Drag to reorder with spring animations; click to bring that Studio forward.
 - **Focus-free control.** Screenshot a covered Studio window, click, type and scroll in it — without moving your
   cursor or changing the foreground window. Several agents can work in several Studios in parallel.
+- **Never lose a busy plugin.** Studio's "<plugin> is not responding — stop this plugin?" box is answered
+  **No** automatically in the background, so long-running MCP/test plugins aren't killed.
 - **Tiny.** ~370 KB exe, ~2 MB private memory, 0% CPU when idle. Pure Rust + Win32, no web view.
 
 ## Install

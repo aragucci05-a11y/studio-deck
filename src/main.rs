@@ -36,7 +36,6 @@ struct Agent { name: String, status: String, step: String, studio: Option<String
 fn status_dir() -> PathBuf {
     PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("studiodeck").join("status")
 }
-
 fn parse_source(text: &str) -> Option<Vec<Agent>> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let updated = v.get("updated").and_then(|u| u.as_u64());
@@ -182,6 +181,45 @@ fn window_title(h: HWND) -> String {
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
+// AUTO-NO: Studio's "<plugin> is not responding - Would you like Studio to stop this plugin?" message box is answered
+// No in the background (WM_COMMAND IDNO to the dialog: no focus change), so a busy MCP/test plugin is never killed.
+fn dialog_text(h: HWND) -> String {
+    unsafe extern "system" fn cb(c: HWND, lp: LPARAM) -> BOOL {
+        let out = unsafe { &mut *(lp as *mut String) };
+        out.push_str(&window_title(c));
+        out.push(' ');
+        1
+    }
+    let mut out = String::new();
+    unsafe { EnumChildWindows(h, Some(cb), &mut out as *mut _ as LPARAM) };
+    out
+}
+fn auto_no_hung_plugin(studios: &[HWND]) {
+    let mut pids: Vec<u32> = Vec::new();
+    for &h in studios {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(h, &mut pid) };
+        pids.push(pid);
+    }
+    unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> BOOL {
+        let v = unsafe { &mut *(lp as *mut Vec<HWND>) };
+        let mut cls = [0u16; 16];
+        let n = unsafe { GetClassNameW(h, cls.as_mut_ptr(), cls.len() as i32) };
+        if String::from_utf16_lossy(&cls[..n.max(0) as usize]) == "#32770" && unsafe { IsWindowVisible(h) } != 0 { v.push(h) }
+        1
+    }
+    let mut dialogs: Vec<HWND> = Vec::new();
+    unsafe { EnumWindows(Some(cb), &mut dialogs as *mut _ as LPARAM) };
+    for d in dialogs {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(d, &mut pid) };
+        if !pids.contains(&pid) && !studio_pid(pid) { continue }
+        let text = dialog_text(d).to_lowercase();
+        if text.contains("is not responding") && text.contains("stop this plugin") {
+            unsafe { PostMessageW(d, WM_COMMAND, IDNO as usize, 0) };
+        }
+    }
+}
 // "C:\...\MyPlace.rbxl - Roblox Studio" -> "MyPlace.rbxl"
 fn place_name(title: &str) -> String {
     let t = title.trim_end_matches(" - Roblox Studio").trim_matches('*').trim();
@@ -227,6 +265,7 @@ impl App {
 
     fn tick(&mut self) {
         let found = find_studios();
+        auto_no_hung_plugin(&found);
         let want = if self.force { true } else if found.len() < 2 { self.dismissed = false; false } else { !self.dismissed };
         if want != self.visible { self.set_visible(want) }
         if !self.visible { return }
@@ -661,7 +700,7 @@ fn main() {
         APP.set(Box::into_raw(boxed));
         app().make_fonts();
         app().tick();
-        SetTimer(hwnd, POLL_TIMER, 2000, None);
+        SetTimer(hwnd, POLL_TIMER, 1000, None);
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);

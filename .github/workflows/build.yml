@@ -4,6 +4,8 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: windows-latest
