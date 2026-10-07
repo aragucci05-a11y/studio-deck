@@ -1,6 +1,6 @@
 // Studio Deck (studiodeck.exe): one window with a live DWM thumbnail of every open Roblox Studio, its RAM, and the
 // task/agent status Claude Code sessions report for it. Runs in the background, shows itself while
-// 2+ Studios are open; tiles reorder by drag (eased, timer runs only while moving). Win32 + GDI; DWM composites thumbnails.
+// 2+ Studios are open; tiles reorder by drag (springs, frames only while moving). Win32 + GDI; DWM composites thumbnails.
 // v0.2: header (counts, RAM, pin = topmost, Pause all, update pill); hover action bar per tile (Save, Publish, Pause
 // agents, Close) + tooltips in a click-through layered popup above the thumbnails; pause = control file agents poll
 // via --check; "Waiting on" line + resolveOn; toasts; spring-physics drag paced by DwmFlush; self-update (update.rs).
@@ -1338,7 +1338,8 @@ impl App {
                 let p = RECT { left: self.px(16), top: self.px(HEADER), right: hb.right, bottom: self.px(HEADER + PANEL - 8) };
                 round(p, CARD, self.px(14));
                 let line = |i: i32, s: &str, f: HFONT, c: u32| text(s, RECT { left: p.left + self.px(16), top: p.top + self.px(10 + 18 * i), right: p.right - self.px(220), bottom: p.top + self.px(28 + 18 * i) }, f, c, DT_LEFT | DT_VCENTER);
-                line(0, &format!("Studio Deck {}  \u{00B7}  {}", r.tag, r.title), self.f_title, TEXT);
+                let head = if r.title == r.tag { format!("Studio Deck {}", r.tag) } else { format!("Studio Deck {}  \u{00B7}  {}", r.tag, r.title) };
+                line(0, &head, self.f_title, TEXT);
                 for (i, l) in r.notes.iter().enumerate() { line(1 + i as i32, l, self.f_body, MUTED) }
                 let (later, doit) = self.panel_btns();
                 if self.update_msg.is_empty() {
