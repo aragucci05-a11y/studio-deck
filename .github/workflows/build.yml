@@ -13,11 +13,20 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
+      # checksum the self-updater verifies before swapping the exe in
+      - shell: pwsh
+        run: |
+          $h = (Get-FileHash target/release/studiodeck.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path target/release/studiodeck.exe.sha256 -Value "$h  studiodeck.exe" -Encoding ascii -NoNewline
       - uses: actions/upload-artifact@v4
         with:
           name: studiodeck
-          path: target/release/studiodeck.exe
+          path: |
+            target/release/studiodeck.exe
+            target/release/studiodeck.exe.sha256
       - if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/studiodeck.exe
+          files: |
+            target/release/studiodeck.exe
+            target/release/studiodeck.exe.sha256

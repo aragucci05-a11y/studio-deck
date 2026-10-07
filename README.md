@@ -16,12 +16,18 @@ calm window.
   (Claude Code, Cursor, Codex, scripts…) with one silent command.
 - **Off unless you want it.** Opens with `--show`; optional background mode (a toggle, default off) waits invisibly
   and appears while 2+ Studios are open — no tray icon, nothing resident when off.
-- **iPhone-style tiles.** Drag to reorder with spring animations; click to bring that Studio forward.
+- **iPhone-style tiles.** Drag to reorder with real spring physics (lift, momentum, rubber-band edges, display-paced
+  frames); click to bring that Studio forward.
+- **Command center per tile.** Hover a tile for Save, Publish (to the existing experience only — disabled for local
+  `.rbxl` files, and any "publish as new game" dialog is cancelled), Pause agents and Close, with in-deck confirms and
+  toasts ("Saved ✓", "Published ✓ 14:02"). Header: Studio count, RAM, Pause all, keep-on-top pin.
+- **Waiting, not idle.** Agents can say what they're waiting on (`waitingOn`) and how it clears itself
+  (`resolveOn: published:<universeId>` or `file:<path>`); the tile shows "Waiting on: user: publish · 4m".
 - **Focus-free control.** Screenshot a covered Studio window, click, type and scroll in it — without moving your
   cursor or changing the foreground window. Several agents can work in several Studios in parallel.
 - **Never lose a busy plugin.** Studio's "<plugin> is not responding — stop this plugin?" box is answered
   **No** automatically in the background, so long-running MCP/test plugins aren't killed.
-- **Tiny.** ~370 KB exe, ~2 MB private memory, 0% CPU when idle. Pure Rust + Win32, no web view.
+- **Tiny.** ~0.5 MB exe, ~2 MB private memory, 0% CPU when idle. Pure Rust + Win32, no web view.
 
 ## Install
 
@@ -31,7 +37,11 @@ Download `studiodeck.exe` from [Releases](../../releases), or build it:
 cargo build --release        # -> target/release/studiodeck.exe
 ```
 
-`studiodeck.exe --show` opens the window (closing it quits). Nothing stays resident unless you turn on
+**Updates:** the deck checks GitHub releases at start and every 6 h and shows a calm "Update vX.Y.Z" pill; updates
+are verified against the release's SHA-256 before the exe is swapped. CLI: `--check-update` (exit 10 = newer),
+`--update`. No other network calls except the public Roblox games API for `resolveOn` / publish confirmations.
+
+`studiodeck.exe --show` opens the window (or surfaces the running one; X hides it to background mode when that is on, else quits). Nothing stays resident unless you turn on
 **background mode** — `studiodeck.exe --background on|off`, or the window's system menu (title-bar icon /
 Alt+Space) → *Run in background*. With it on, `studiodeck.exe` waits invisibly (no tray icon) and appears while 2+
 Studios are open; turning it off quits it within a second. Optional autostart: `--install` (also turns background
@@ -56,6 +66,10 @@ studiodeck.exe --status my-session MyGame '[{"name":"Fix fog shader","status":"r
 - `studio`: case-insensitive substring of the Studio window title / place name — that tile shows the agent.
 - Pass `-` instead of the JSON to read it from stdin (handy from PowerShell).
 - Files live in `%LOCALAPPDATA%\studiodeck\status\<session>.json`; older than 30 min = dimmed, older than 2 h = ignored.
+- Waiting: add `"waitingOn":"user: publish in Studio"` (status `waiting`/`blocked`), optionally
+  `"resolveOn":"published:<universeId>"` or `"file:<path>"` — the deck flips the entry to done when it happens.
+- Pause: the user can pause agents per Studio; agents run `studiodeck.exe --check <title>` before acting
+  (exit 3 = paused, wait and retry). Scripts: `--pause <title>` / `--resume <title>`. See [AGENTS.md](AGENTS.md).
 
 **Claude Code users:** add one line to `~/.claude/CLAUDE.md` so every session uses it:
 
