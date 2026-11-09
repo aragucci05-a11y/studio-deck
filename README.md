@@ -45,8 +45,8 @@ are verified against the release's SHA-256 before the exe is swapped. CLI: `--ch
 **background mode** — `studiodeck.exe --background on|off`, or the window's system menu (title-bar icon /
 Alt+Space) → *Run in background*. With it on, `studiodeck.exe` waits invisibly (no tray icon) and appears while 2+
 Studios are open; turning it off quits it within a second. Optional autostart: `--install` (also turns background
-on; `--uninstall` turns both off). `--show-when <n>` sets how many open Studios make it appear (default 2;
-`1` = whenever Studio is open).
+on; `--uninstall` turns both off). `--show-when <n>` sets how many open Studios make it appear (2-9, default 2;
+it never shows with only one Studio open).
 Quit: `taskkill /im studiodeck.exe`.
 
 ## For AI agents

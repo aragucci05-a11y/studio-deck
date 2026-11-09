@@ -545,7 +545,8 @@ impl App {
         // A window the user opened or touched stays until closed. An auto-shown one hides below `min` Studios,
         // unless an agent is waiting or a toast is up.
         let stay = self.visible && (self.status.agents.iter().any(|a| is_waiting(&a.status)) || self.tiles.iter().any(|t| t.toast.is_some()));
-        let want = if self.force || self.shown { true } else if found.len() < min && !stay { self.dismissed = false; false } else { !self.dismissed };
+        if found.len() < min { self.dismissed = false }
+        let want = want_visible(found.len(), min, self.force || self.shown, stay, self.dismissed);
         if want != self.visible { self.set_visible(want) }
         if !self.visible { return }
         let new_studio = found.iter().any(|h| !self.tiles.iter().any(|t| t.src == *h));
@@ -1439,10 +1440,17 @@ fn set_background(on: bool) -> Result<(), String> {
 }
 const SC_BACKGROUND: usize = 0x1010;
 const SC_TOPMOST: usize = 0x1020;
-// background mode shows the deck while at least this many Studios are open (setting "showWhen", default 2)
-fn min_studios() -> usize { read_settings().get("showWhen").and_then(|n| n.as_u64()).map(|n| n.clamp(1, 9) as usize).unwrap_or(2) }
+// background mode shows the deck while at least this many Studios are open (setting "showWhen", default 2).
+// Never below 2: with one Studio there is nothing to switch between, so the deck stays hidden (an old "showWhen":1 counts as 2).
+const MIN_STUDIOS: usize = 2;
+fn min_studios() -> usize { read_settings().get("showWhen").and_then(|n| n.as_u64()).map(|n| n.clamp(MIN_STUDIOS as u64, 9) as usize).unwrap_or(MIN_STUDIOS) }
+// Below MIN_STUDIOS nothing shows it, not even --show or a user-touched window (it comes back at 2+).
+// Between that and `min`, an opened/touched window or a waiting agent/toast keeps it up; at `min`+ it auto-shows unless dismissed.
+fn want_visible(studios: usize, min: usize, opened: bool, stay: bool, dismissed: bool) -> bool {
+    if studios < MIN_STUDIOS { false } else if opened { true } else if studios < min && !stay { false } else { !dismissed }
+}
 fn set_show_when(arg: Option<&String>) -> Result<(), String> {
-    let n: u64 = arg.and_then(|a| a.parse().ok()).filter(|n| (1..=9).contains(n)).ok_or("usage: --show-when <1-9>")?;
+    let n: u64 = arg.and_then(|a| a.parse().ok()).filter(|n| (2..=9).contains(n)).ok_or("usage: --show-when <2-9>")?;
     let mut v = read_settings();
     v["showWhen"] = n.into();
     std::fs::write(settings_path(), v.to_string()).map_err(|e| e.to_string())
@@ -1498,7 +1506,8 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             WM_SHOWDECK => {
                 // a second `--show` launch: show until the user closes it (closing hides; background keeps running)
                 (a.shown, a.dismissed) = (true, false);
-                if !a.visible { a.set_visible(true); a.tick(); }
+                if !a.visible { a.tick(); } // shows it only with 2+ Studios open
+                if !a.visible { return 0 }
                 if IsIconic(h) != 0 { ShowWindow(h, SW_RESTORE); }
                 SetForegroundWindow(h);
                 0
@@ -1735,4 +1744,21 @@ fn iso_times() {
     assert_eq!(parse_iso("2026-10-07T05:59:39.5Z"), Some(1_791_352_779_500));
     assert_eq!(parse_iso("2000-03-01T00:00:00.123Z"), Some(951_868_800_123));
     assert_eq!(place_key("LW_Test1.rbxl"), "lw_test1");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::want_visible as v;
+    #[test]
+    fn needs_two_studios() {
+        for opened in [false, true] { for stay in [false, true] {
+            assert!(!v(0, 2, opened, stay, false));
+            assert!(!v(1, 2, opened, stay, false)); // one Studio: never, even --show / touched / waiting agent
+        } }
+        assert!(v(2, 2, false, false, false));  // auto-shows at 2
+        assert!(!v(2, 2, false, false, true));  // unless the user closed it
+        assert!(v(2, 3, true, false, false));   // opened by the user, below a higher showWhen
+        assert!(v(2, 3, false, true, false));   // waiting agent keeps it up
+        assert!(!v(2, 3, false, false, false));
+    }
 }
