@@ -6,6 +6,8 @@
 // via --check; "Waiting on" line + resolveOn; toasts; spring-physics drag paced by DwmFlush; self-update (update.rs).
 // v0.4: Images gallery (header button): every image Claude sent or looked at in chat. Opens on a scrolling grid of all of
 // them; click one (or Enter) for the big view + filmstrip, Esc back to the grid.
+// v0.6: the header's update button is always there: "Check for updates" asks GitHub now; a newer release opens the
+// update panel (Update downloads, verifies and restarts the deck), else it says "Up to date" for a few seconds.
 // v0.5: Music gallery (header button): every track agents made, by game then agent (music.rs); click a card to play/stop.
 // v0.3: Apps panel (entries with "app": Blender, LMMS, any MCP server; live window thumbnail, progress), fed by agents or
 // automatically by the --mcp-hook Claude Code hook; click an app header to fold it, its thumbnail (or right-click a tile) to enlarge.
@@ -192,7 +194,6 @@ fn log(what: &str, place: &str) {
     let _ = std::fs::create_dir_all(deck_dir());
     let _ = std::fs::OpenOptions::new().create(true).append(true).open(deck_dir().join("log.txt")).and_then(|mut f| f.write_all(line.as_bytes()));
 }
-// <repo>/tools/studiopanel/target/release/studiodeck.exe -> <repo>/.claude/lw-agents.json (legacy source)
 fn parse_source(text: &str) -> Option<Vec<Agent>> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let updated = v.get("updated").and_then(|u| u.as_u64());
@@ -597,6 +598,8 @@ struct App {
     overlay: HWND, hot: Option<usize>, hdr: u8, confirm: Option<(HWND, Act)>, pc_mem: (f64, f64),
     pending: Vec<Pending>,
     update: Option<update::Release>, update_open: bool, update_msg: String,
+    // checking = a check the user asked for is running; uptodate_until = show "Up to date" until then (ms)
+    checking: bool, uptodate_until: u64,
     // TOOLTIPS: tip_want = (text, anchor) under the pointer; shown as `tip` (text, label rect) after 500 ms (TIP_TIMER).
     tip_want: Option<(String, RECT, (i32, i32))>, tip: Option<(String, RECT)>,
     // shown = the user opened it (--show, shortcut) or touched it (click, drag, resize): stays up until closed.
@@ -1182,7 +1185,26 @@ impl App {
         RECT { left: cr.right - self.px(16 + 92), top: self.px(8), right: cr.right - self.px(16), bottom: self.px(HEADER - 4) }
     }
     fn pin_btn(&self) -> RECT { let b = self.header_btn(); RECT { left: b.left - self.px(8 + 28), right: b.left - self.px(8), ..b } }
-    fn update_label(&self) -> Option<String> { self.update.as_ref().map(|r| format!("Update {}", r.tag)) }
+    fn update_label(&self) -> Option<String> {
+        Some(match &self.update {
+            Some(r) => format!("Update {}", r.tag),
+            None if self.checking => "Checking\u{2026}".into(),
+            None if now_ms() < self.uptodate_until => format!("Up to date  v{}", env!("CARGO_PKG_VERSION")),
+            None => "Check for updates".into(),
+        })
+    }
+    // The update button with no update known: ask GitHub now (the answer comes back through UPD + WM_UPDATE).
+    fn check_now(&mut self) {
+        if self.checking { return }
+        self.checking = true;
+        let deck = self.hwnd as usize;
+        std::thread::spawn(move || {
+            let r = update::newer();
+            *UPD.lock().unwrap() = Some(Ok(r.unwrap_or(None)));
+            unsafe { PostMessageW(deck as HWND, WM_UPDATE, 0, 0) };
+        });
+        unsafe { InvalidateRect(self.hwnd, null(), 0) };
+    }
     fn update_btn(&self) -> Option<RECT> {
         let p = self.pin_btn();
         self.update_label().map(|l| RECT { left: p.left - self.px(8) - self.text_w(&l, self.f_body) - self.px(24), right: p.left - self.px(8), ..p })
@@ -1318,7 +1340,7 @@ impl App {
         match self.hdr {
             H_PAUSE => return Some((s(if self.all_paused() { "Let all agents continue" } else { "Pause all agents" }), self.header_btn())),
             H_PIN => return Some((s("Keep Studio Deck on top"), self.pin_btn())),
-            H_UPD => return self.update.as_ref().zip(self.update_btn()).map(|(r, b)| (format!("Update to {}", r.tag), b)),
+            H_UPD => return self.update_btn().map(|b| (self.update.as_ref().map_or("Check GitHub for a newer Studio Deck".into(), |r| format!("Update to {}", r.tag)), b)),
             0 => {}
             _ => return None,
         }
@@ -1469,7 +1491,10 @@ impl App {
     fn update_found(&mut self, r: Option<update::Release>) {
         let s = &self.settings["snooze"];
         let snoozed = |r: &update::Release| s["tag"].as_str() == Some(&r.tag) && s["until"].as_u64().is_some_and(|u| now_ms() < u);
-        self.update = r.filter(|r| !snoozed(r));
+        let asked = std::mem::take(&mut self.checking); // the user pressed the button: no snooze, open the panel or say so
+        self.update = r.filter(|r| asked || !snoozed(r));
+        if asked && self.update.is_some() { (self.update_open, self.update_msg) = (true, String::new()) }
+        if asked && self.update.is_none() { self.uptodate_until = now_ms() + 4000 }
         if self.update.is_none() { self.update_open = false }
         self.layout(false);
     }
@@ -1560,6 +1585,7 @@ impl App {
         match self.hdr {
             H_PAUSE => return self.pause_all(),
             H_PIN => return self.toggle_topmost(),
+            H_UPD if self.update.is_none() => return self.check_now(),
             H_UPD => { self.update_open = !self.update_open; self.update_msg.clear(); return self.layout(false) }
             H_LATER => return self.snooze_update(),
             H_DO => return self.start_update(),
@@ -1757,7 +1783,8 @@ impl App {
             let on = self.topmost_setting();
             text(if on { "\u{E840}" } else { "\u{E718}" }, pin, self.f_icon, if on { TEXT } else { DIM }, DT_CENTER | DT_VCENTER);
             if let (Some(u), Some(l)) = (ub, self.update_label()) {
-                round(u, if self.hdr == H_UPD { rgb(20, 92, 170) } else { rgb(14, 70, 132) }, u.bottom - u.top);
+                let fill = match (self.update.is_some(), self.hdr == H_UPD) { (true, true) => rgb(20, 92, 170), (true, false) => rgb(14, 70, 132), (false, true) => CARD_HOVER, _ => CARD };
+                round(u, fill, u.bottom - u.top);
                 text(&l, u, self.f_body, TEXT, DT_CENTER | DT_VCENTER);
             }
             if self.update_open && let Some(r) = &self.update {
@@ -2278,7 +2305,7 @@ fn main() {
             icon_face: pick_face(&["Segoe Fluent Icons", "Segoe MDL2 Assets"]), f_title: null_mut(), f_body: null_mut(), f_icon: null_mut(),
             card: (0.0, 0.0), slots: Vec::new(), drag: None, animating: false, last_frame: Instant::now(), settings,
             overlay, hot: None, hdr: 0, confirm: None, pc_mem: (0.0, 0.0), pending: Vec::new(), shown: force,
-            update: None, update_open: false, update_msg: String::new(), tip_want: None, tip: None, back: (null_mut(), 0, 0), groups: Vec::new(), zoom: None, collapsed: Default::default(),
+            update: None, update_open: false, update_msg: String::new(), checking: false, uptodate_until: 0, tip_want: None, tip: None, back: (null_mut(), 0, 0), groups: Vec::new(), zoom: None, collapsed: Default::default(),
             music: false, tracks: Vec::new(), tracks_at: None, mus_top: 0, playing: None,
             grid: true, gal_top: 0, gallery: false, gal: gallery::list(), gal_i: 0, gal_seen: 0, thumbs: HashMap::new(), big: None, asked: Default::default(), gal_tx: gallery::worker(hwnd),
             trace: std::env::var_os("STUDIODECK_TRACE").and_then(|p| std::fs::File::create(p).ok()),
