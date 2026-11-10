@@ -6,6 +6,8 @@
 // via --check; "Waiting on" line + resolveOn; toasts; spring-physics drag paced by DwmFlush; self-update (update.rs).
 // v0.4: Images gallery (header button): every image Claude sent or looked at in chat. Opens on a scrolling grid of all of
 // them; click one (or Enter) for the big view + filmstrip, Esc back to the grid.
+// v0.8: Music view has a player bar at the bottom: play/pause, time, and a scrub bar (click or drag to seek). Everything
+// plays inside the deck; a format Windows can't decode says so instead of opening another app.
 // v0.7: pinned (keep on top), the deck keeps its own space: a Studio window that opens over it (or maximises over it in its
 // first 20 s) is moved beside it, never activated; and the deck re-asserts its place over an always-on-top Studio window.
 // v0.6: the header's update button is always there: "Check for updates" asks GitHub now; a newer release opens the
@@ -618,11 +620,14 @@ struct App {
     grid: bool, gal_top: i32,
     // MUSIC view (open = music): tracks from music.rs, scrolled by mus_top; playing = the track MCI is playing.
     music: bool, tracks: Vec<music::Track>, tracks_at: Option<SystemTime>, mus_top: i32, playing: Option<PathBuf>,
+    // the loaded track's player: paused by the user; scrub = Some(ms) while the scrub bar is dragged; mus_msg = a short note (until ms)
+    paused: bool, scrub: Option<u64>, mus_len: u64, mus_msg: Option<(String, u64)>,
     gallery: bool, gal: Vec<PathBuf>, gal_i: usize, gal_seen: u64, thumbs: HashMap<PathBuf, (HBITMAP, i32, i32)>,
     big: Option<(PathBuf, HBITMAP, i32, i32)>, asked: std::collections::HashSet<(PathBuf, bool)>, gal_tx: std::sync::mpsc::Sender<(PathBuf, (u32, u32), bool)>,
 }
 const WATCH_TIMER: usize = 3;
 const TIP_TIMER: usize = 4;
+const PLAYER_TIMER: usize = 5; // repaints the player bar (5 Hz) while the music view is open
 const WM_SHOWDECK: u32 = WM_APP + 2;
 const WM_FRAME: u32 = WM_APP + 3; // next animation frame (paced by DwmFlush)
 const WM_UPDATE: u32 = WM_APP + 4; // UPD has a result
@@ -1263,16 +1268,54 @@ impl App {
     fn refresh_music(&mut self) {
         let at = std::fs::metadata(crate::deck_dir().join("music.json")).and_then(|m| m.modified()).ok();
         if at != self.tracks_at { (self.tracks, self.tracks_at) = (music::load(), at); if self.music { unsafe { InvalidateRect(self.hwnd, null(), 0) }; } }
-        if self.playing.is_some() && !music::playing() { self.playing = None; unsafe { InvalidateRect(self.hwnd, null(), 0) }; }
+        // finished on its own (a paused or scrubbed track reads "stopped" too, so only when neither)
+        if self.playing.is_some() && !self.paused && self.scrub.is_none() && music::mode() == "stopped" { self.unload() }
+    }
+    fn unload(&mut self) {
+        music::stop();
+        (self.playing, self.paused, self.scrub) = (None, false, None);
+        unsafe { InvalidateRect(self.hwnd, null(), 0) };
+    }
+    // Card click: a new track loads and plays; the loaded one pauses / resumes.
+    fn play_track(&mut self, p: PathBuf) {
+        if self.playing.as_ref() == Some(&p) {
+            self.paused = !self.paused;
+            if self.paused { music::pause() } else { music::resume() }
+        } else if music::play(&p) {
+            (self.mus_len, self.playing, self.paused) = (music::length(), Some(p), false);
+        } else {
+            self.unload();
+            let ext = p.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
+            self.mus_msg = Some((format!("Windows can't play this {ext} file"), now_ms() + 4000));
+        }
+        unsafe { InvalidateRect(self.hwnd, null(), 0) };
+    }
+    // Player bar under the track list while a track is loaded (or a note is up): whole bar, play/pause button, scrub track.
+    fn player(&self) -> Option<(RECT, RECT, RECT)> {
+        if self.playing.is_none() && self.mus_msg.as_ref().is_none_or(|m| now_ms() > m.1) { return None }
+        let a = self.grid_area();
+        let bar = RECT { left: a.left, top: a.bottom - self.px(64), right: a.right, bottom: a.bottom };
+        let btn = RECT { left: bar.left + self.px(10), top: bar.top + self.px(10), right: bar.left + self.px(54), bottom: bar.bottom - self.px(10) };
+        let track = RECT { left: btn.right + self.px(16), top: bar.top + self.px(38), right: bar.right - self.px(130), bottom: bar.top + self.px(56) };
+        Some((bar, btn, track))
+    }
+    fn scrub_ms(&self, x: i32) -> u64 {
+        let Some((_, _, t)) = self.player() else { return 0 };
+        ((x - t.left) as f64 / (t.right - t.left).max(1) as f64).clamp(0.0, 1.0).mul_add(self.mus_len as f64, 0.0) as u64
+    }
+    fn invalidate_player(&self) {
+        if let Some((bar, _, _)) = self.player() { unsafe { InvalidateRect(self.hwnd, &bar, 0) }; }
     }
     fn set_music(&mut self, on: bool) {
         self.music = on && !self.tracks.is_empty();
+        unsafe { if self.music { SetTimer(self.hwnd, PLAYER_TIMER, 200, None); } else { KillTimer(self.hwnd, PLAYER_TIMER); } }
         if self.music { (self.zoom, self.gallery) = (None, false) }
         self.apply_thumbs();
     }
     // Music view: area, content height, and the visible items: game headings, agent sub-headings, track cards.
     fn music_layout(&self) -> (RECT, i32, Vec<(MItem, RECT)>) {
-        let a = self.grid_area();
+        let mut a = self.grid_area();
+        if let Some((bar, _, _)) = self.player() { a.bottom = bar.top - self.px(10) }
         let gap = self.px(10);
         let cols = ((a.right - a.left + gap) / (self.px(MUSIC_CARD) + gap)).max(1);
         let cw = (a.right - a.left - gap * (cols - 1)) / cols;
@@ -1635,11 +1678,22 @@ impl App {
         if let (Some(b), Some(k)) = (self.bar(), self.hot) { self.press(b, k); return }
         if self.confirm.take().is_some() { self.render_overlay() }
         if self.music {
+            if let Some((bar, btn, track)) = self.player() && inside(&bar, x, y) {
+                if self.playing.is_none() { return }
+                if inside(&btn, x, y) { let p = self.playing.clone().unwrap(); return self.play_track(p) }
+                // the scrub track, with some slack above and below so it's easy to grab
+                if x >= track.left - self.px(8) && x <= track.right + self.px(8) && y >= track.top - self.px(14) {
+                    let ms = self.scrub_ms(x);
+                    self.scrub = Some(ms);
+                    music::seek(ms, false);
+                    unsafe { SetCapture(self.hwnd) };
+                    self.invalidate_player();
+                }
+                return;
+            }
             if let Some((MItem::Track(i), _)) = self.music_layout().2.into_iter().find(|(it, r)| matches!(it, MItem::Track(_)) && inside(r, x, y)) {
                 let p = self.tracks[i].path.clone();
-                if self.playing.as_ref() == Some(&p) { music::stop(); self.playing = None }
-                else { self.playing = music::play(&p).then_some(p) }
-                unsafe { InvalidateRect(self.hwnd, null(), 0) };
+                self.play_track(p);
             }
             return;
         }
@@ -1670,6 +1724,12 @@ impl App {
     // Lifted tile: scale springs to LIFT_SCALE (~0.25 s), position follows the (rubber-banded) pointer through a
     // stiff critically-damped spring; neighbours retarget with a small stagger.
     fn mouse_move(&mut self, x: i32, y: i32) {
+        if self.scrub.is_some() {
+            let ms = self.scrub_ms(x);
+            self.scrub = Some(ms);
+            music::seek(ms, false);
+            return self.invalidate_player();
+        }
         let thresh = self.px(4);
         let mut cr: RECT = unsafe { zeroed() };
         unsafe { GetClientRect(self.hwnd, &mut cr) };
@@ -1716,6 +1776,11 @@ impl App {
     }
 
     fn mouse_up(&mut self, x: i32, y: i32) {
+        if let Some(ms) = self.scrub.take() {
+            unsafe { ReleaseCapture() };
+            music::seek(ms, !self.paused); // let go: carry on playing from there (a paused track stays paused there)
+            return self.invalidate_player();
+        }
         let Some(d) = self.drag.take() else { return };
         unsafe { ReleaseCapture() };
         if d.moved {
@@ -1858,7 +1923,8 @@ impl App {
                             let on = self.playing.as_ref() == Some(&t.path);
                             round(r, if on { rgb(10, 132, 255) } else { CARD }, self.px(8));
                             let icon = RECT { left: r.left + self.px(8), right: r.left + self.px(36), ..r };
-                            text(if on { "\u{25A0}" } else { "\u{25B6}" }, icon, self.f_title, if on { TEXT } else { rgb(120, 180, 255) }, DT_CENTER | DT_VCENTER);
+                            // Segoe MDL2/Fluent: Pause on the playing card, Play elsewhere
+                            text(if on && !self.paused { "\u{E769}" } else { "\u{E768}" }, icon, self.f_icon, if on { TEXT } else { rgb(120, 180, 255) }, DT_CENTER | DT_VCENTER);
                             let name = t.path.file_stem().unwrap_or_default().to_string_lossy().replace('_', " ");
                             let sub = t.path.parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
                             let (l, rt) = (r.left + self.px(42), r.right - self.px(8));
@@ -1874,6 +1940,28 @@ impl App {
                     let bar = (h * h / content).max(self.px(24));
                     let y = area.top + ((h - bar) as i64 * self.mus_top as i64 / (content - h).max(1) as i64) as i32;
                     round(RECT { left: area.right + self.px(5), top: y, right: area.right + self.px(10), bottom: y + bar }, DIM, self.px(4));
+                }
+                if let Some((bar, btn, track)) = self.player() {
+                    round(bar, CARD_HOVER, self.px(12));
+                    match (&self.playing, &self.mus_msg) {
+                        (Some(p), _) => {
+                            round(btn, rgb(10, 132, 255), btn.bottom - btn.top);
+                            text(if self.paused { "\u{E768}" } else { "\u{E769}" }, btn, self.f_icon, TEXT, DT_CENTER | DT_VCENTER);
+                            let pos = self.scrub.unwrap_or_else(music::position).min(self.mus_len);
+                            let name = p.file_stem().unwrap_or_default().to_string_lossy().replace('_', " ");
+                            text(&name, RECT { left: track.left, top: bar.top + self.px(8), right: track.right, bottom: bar.top + self.px(32) }, self.f_title, TEXT, DT_LEFT | DT_VCENTER);
+                            text(&format!("{} / {}", music::clock(pos), music::clock(self.mus_len)), RECT { left: track.right + self.px(12), right: bar.right - self.px(12), ..bar }, self.f_body, TEXT, DT_RIGHT | DT_VCENTER);
+                            let mid = (track.top + track.bottom) / 2;
+                            let line = RECT { left: track.left, top: mid - self.px(3), right: track.right, bottom: mid + self.px(3) };
+                            round(line, DIM, self.px(6));
+                            let x = track.left + ((track.right - track.left) as f64 * pos as f64 / self.mus_len.max(1) as f64) as i32;
+                            round(RECT { right: x.max(line.left + self.px(6)), ..line }, rgb(10, 132, 255), self.px(6));
+                            let k = self.px(8);
+                            round(RECT { left: x - k, top: mid - k, right: x + k, bottom: mid + k }, TEXT, 2 * k);
+                        }
+                        (None, Some((m, _))) => text(m, bar, self.f_body, AMBER, DT_CENTER | DT_VCENTER),
+                        _ => {}
+                    }
                 }
                 return;
             }
@@ -2105,6 +2193,14 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             }
             WM_TIMER if wp == WATCH_TIMER => { a.watch(); 0 }
             WM_TIMER if wp == TIP_TIMER => { a.show_tip(); 0 }
+            WM_TIMER if wp == PLAYER_TIMER => {
+                // only while something moves: a playing track's position, or a note that's due to go
+                if a.mus_msg.as_ref().is_some_and(|m| now_ms() > m.1) { a.mus_msg = None; InvalidateRect(h, null(), 0); }
+                if a.playing.is_some() && !a.paused && a.scrub.is_none() {
+                    if music::mode() == "stopped" { a.unload() } else { a.invalidate_player() }
+                }
+                0
+            }
             WM_TOAST => {
                 let q: Vec<_> = TOASTS.lock().unwrap().drain(..).collect();
                 for (src, text, c) in q { a.toast(src as HWND, &text, c) }
@@ -2181,7 +2277,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             WM_CAPTURECHANGED if a.drag.is_some() => { a.mouse_up(i32::MIN, i32::MIN); 0 }
             WM_MOUSEMOVE => {
                 let (x, y) = xy(lp);
-                if a.drag.is_some() { a.mouse_move(x, y); return 0 }
+                if a.drag.is_some() || a.scrub.is_some() { a.mouse_move(x, y); return 0 }
                 a.update_hover(x, y);
                 0
             }
@@ -2345,7 +2441,7 @@ fn main() {
             card: (0.0, 0.0), slots: Vec::new(), drag: None, animating: false, last_frame: Instant::now(), settings,
             overlay, hot: None, hdr: 0, confirm: None, pc_mem: (0.0, 0.0), pending: Vec::new(), shown: force,
             update: None, update_open: false, update_msg: String::new(), checking: false, uptodate_until: 0, seen: None, tip_want: None, tip: None, back: (null_mut(), 0, 0), groups: Vec::new(), zoom: None, collapsed: Default::default(),
-            music: false, tracks: Vec::new(), tracks_at: None, mus_top: 0, playing: None,
+            music: false, tracks: Vec::new(), tracks_at: None, mus_top: 0, playing: None, paused: false, scrub: None, mus_len: 0, mus_msg: None,
             grid: true, gal_top: 0, gallery: false, gal: gallery::list(), gal_i: 0, gal_seen: 0, thumbs: HashMap::new(), big: None, asked: Default::default(), gal_tx: gallery::worker(hwnd),
             trace: std::env::var_os("STUDIODECK_TRACE").and_then(|p| std::fs::File::create(p).ok()),
         });
