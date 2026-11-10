@@ -6,6 +6,8 @@
 // via --check; "Waiting on" line + resolveOn; toasts; spring-physics drag paced by DwmFlush; self-update (update.rs).
 // v0.4: Images gallery (header button): every image Claude sent or looked at in chat. Opens on a scrolling grid of all of
 // them; click one (or Enter) for the big view + filmstrip, Esc back to the grid.
+// v0.7: pinned (keep on top), the deck keeps its own space: a Studio window that opens over it (or maximises over it in its
+// first 20 s) is moved beside it, never activated; and the deck re-asserts its place over an always-on-top Studio window.
 // v0.6: the header's update button is always there: "Check for updates" asks GitHub now; a newer release opens the
 // update panel (Update downloads, verifies and restarts the deck), else it says "Up to date" for a few seconds.
 // v0.5: Music gallery (header button): every track agents made, by game then agent (music.rs); click a card to play/stop.
@@ -600,6 +602,8 @@ struct App {
     update: Option<update::Release>, update_open: bool, update_msg: String,
     // checking = a check the user asked for is running; uptodate_until = show "Up to date" until then (ms)
     checking: bool, uptodate_until: u64,
+    // seen = when each Studio window first appeared (0 = already open when the deck started); see make_room
+    seen: Option<HashMap<usize, u64>>,
     // TOOLTIPS: tip_want = (text, anchor) under the pointer; shown as `tip` (text, label rect) after 500 ms (TIP_TIMER).
     tip_want: Option<(String, RECT, (i32, i32))>, tip: Option<(String, RECT)>,
     // shown = the user opened it (--show, shortcut) or touched it (click, drag, resize): stays up until closed.
@@ -665,6 +669,11 @@ impl App {
         if !self.force && !background_enabled() { unsafe { PostQuitMessage(0) }; return }
         let found = find_studios();
         auto_no_hung_plugin(&found);
+        let now = now_ms();
+        let first = self.seen.is_none();
+        let seen = self.seen.get_or_insert_with(HashMap::new);
+        seen.retain(|h, _| found.contains(&(*h as HWND)));
+        for &h in &found { seen.entry(h as usize).or_insert(if first { 0 } else { now }); }
         let min = min_studios();
         // A window the user opened or touched stays until closed. An auto-shown one hides below `min` Studios,
         // unless an agent is waiting or a toast is up.
@@ -680,6 +689,7 @@ impl App {
         if !self.visible { return }
         let new_studio = found.iter().any(|h| !self.tiles.iter().any(|t| t.src == *h));
         self.apply_topmost(new_studio, &found);
+        if self.topmost_setting() && self.is_top() { self.keep_space(&found, now) }
         self.refresh_groups();
         self.refresh_gallery();
         self.refresh_music();
@@ -746,6 +756,35 @@ impl App {
         });
         let want = self.topmost_setting() && !modal;
         if want != self.is_top() || (reassert && want) { self.set_top(want) }
+    }
+    // PIN keeps the deck's space: Studio windows that appeared in the last 20 s and overlap the deck move beside it (the
+    // wider free side of the deck's monitor, restored first if maximised; nothing is activated). Then, if any visible
+    // always-on-top Studio window (its loading splash) overlaps the deck, the deck goes back to the top of that band.
+    fn keep_space(&mut self, studios: &[HWND], now: u64) {
+        let rect = |h: HWND| { let mut r: RECT = unsafe { zeroed() }; unsafe { GetWindowRect(h, &mut r) }; r };
+        let overlaps = |a: &RECT, b: &RECT| a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+        let deck = rect(self.hwnd);
+        let seen = self.seen.as_ref().map(|s| s.clone()).unwrap_or_default();
+        for &h in studios {
+            let born = seen.get(&(h as usize)).copied().unwrap_or(0);
+            if born == 0 || now.saturating_sub(born) > 20_000 || unsafe { IsIconic(h) } != 0 || !overlaps(&rect(h), &deck) { continue }
+            let mut mi: MONITORINFO = unsafe { zeroed() };
+            mi.cbSize = size_of::<MONITORINFO>() as u32;
+            unsafe { GetMonitorInfoW(MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) };
+            let wa = mi.rcWork;
+            let (left, right) = (deck.left - wa.left, wa.right - deck.right);
+            let gap = self.px(8);
+            let (x, w) = if right >= left { (deck.right + gap, right - gap) } else { (wa.left, left - gap) };
+            if w < self.px(640) { continue } // no room beside the deck on this monitor: leave it
+            unsafe {
+                if IsZoomed(h) != 0 { ShowWindow(h, SW_SHOWNOACTIVATE); }
+                SetWindowPos(h, null_mut(), x, wa.top, w, wa.bottom - wa.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+        let splash = studios.iter().any(|&h| process_windows(window_pid(h)).into_iter().any(|w| {
+            (unsafe { GetWindowLongPtrW(w, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST) != 0 && overlaps(&rect(w), &deck)
+        }));
+        if splash { self.set_top(true) }
     }
     // Read from the window itself: Studio's activation can clear the bit behind our back.
     fn is_top(&self) -> bool { unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0 } }
@@ -2305,7 +2344,7 @@ fn main() {
             icon_face: pick_face(&["Segoe Fluent Icons", "Segoe MDL2 Assets"]), f_title: null_mut(), f_body: null_mut(), f_icon: null_mut(),
             card: (0.0, 0.0), slots: Vec::new(), drag: None, animating: false, last_frame: Instant::now(), settings,
             overlay, hot: None, hdr: 0, confirm: None, pc_mem: (0.0, 0.0), pending: Vec::new(), shown: force,
-            update: None, update_open: false, update_msg: String::new(), checking: false, uptodate_until: 0, tip_want: None, tip: None, back: (null_mut(), 0, 0), groups: Vec::new(), zoom: None, collapsed: Default::default(),
+            update: None, update_open: false, update_msg: String::new(), checking: false, uptodate_until: 0, seen: None, tip_want: None, tip: None, back: (null_mut(), 0, 0), groups: Vec::new(), zoom: None, collapsed: Default::default(),
             music: false, tracks: Vec::new(), tracks_at: None, mus_top: 0, playing: None,
             grid: true, gal_top: 0, gallery: false, gal: gallery::list(), gal_i: 0, gal_seen: 0, thumbs: HashMap::new(), big: None, asked: Default::default(), gal_tx: gallery::worker(hwnd),
             trace: std::env::var_os("STUDIODECK_TRACE").and_then(|p| std::fs::File::create(p).ok()),
