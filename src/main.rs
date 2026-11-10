@@ -1,14 +1,22 @@
 // Studio Deck (studiodeck.exe): one window with a live DWM thumbnail of every open Roblox Studio, its RAM, and the
 // task/agent status Claude Code sessions report for it. Runs in the background, shows itself while
 // 2+ Studios are open; tiles reorder by drag (springs, frames only while moving). Win32 + GDI; DWM composites thumbnails.
-// v0.2: header (counts, RAM, pin = topmost, Pause all, update pill); hover action bar per tile (Save, Publish, Pause
-// agents, Close) + tooltips in a click-through layered popup above the thumbnails; pause = control file agents poll
+// v0.2: header (counts, RAM, pin = topmost, Pause all, update pill); hover action bar per tile (Save, Publish, Mute
+// (Windows mixer, audio.rs), Pause agents, Close) + tooltips in a click-through layered popup above the thumbnails; pause = control file agents poll
 // via --check; "Waiting on" line + resolveOn; toasts; spring-physics drag paced by DwmFlush; self-update (update.rs).
+// v0.4: Images gallery (header button): every image Claude sent or looked at in chat. Opens on a scrolling grid of all of
+// them; click one (or Enter) for the big view + filmstrip, Esc back to the grid.
+// v0.5: Music gallery (header button): every track agents made, by game then agent (music.rs); click a card to play/stop.
+// v0.3: Apps panel (entries with "app": Blender, LMMS, any MCP server; live window thumbnail, progress), fed by agents or
+// automatically by the --mcp-hook Claude Code hook; click an app header to fold it, its thumbnail (or right-click a tile) to enlarge.
 #![windows_subsystem = "windows"]
 
 use std::{collections::HashMap, ffi::c_void, mem::zeroed, path::PathBuf, ptr::{null, null_mut}, time::{Instant, SystemTime}};
+mod audio;
 mod remote;
 mod update;
+mod gallery;
+mod music;
 use windows_sys::core::BOOL;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 use windows_sys::Win32::{
@@ -38,7 +46,10 @@ fn now_ms() -> u64 { SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ma
 
 #[derive(Clone)]
 struct Agent { name: String, status: String, step: String, studio: Option<String>, updated: Option<u64>, waiting_on: String, since: u64,
-    resolve_on: String, resolved: String, src: PathBuf, place_id: String, universe: String }
+    resolve_on: String, resolved: String, src: PathBuf, place_id: String, universe: String,
+    // APPS panel: app = the tool/app the agent drives ("blender", "lmms", any MCP server); progress 0..1; window = exe-name
+    // substring for the live thumbnail (default: the app name's first word).
+    app: String, progress: Option<f64>, window: String }
 fn is_waiting(status: &str) -> bool { matches!(status, "waiting" | "blocked") }
 
 // RESOLVE: a waiting entry with "resolveOn" clears itself: "published:<universeId>" when the public games API reports
@@ -181,7 +192,7 @@ fn log(what: &str, place: &str) {
     let _ = std::fs::create_dir_all(deck_dir());
     let _ = std::fs::OpenOptions::new().create(true).append(true).open(deck_dir().join("log.txt")).and_then(|mut f| f.write_all(line.as_bytes()));
 }
-
+// <repo>/tools/studiopanel/target/release/studiodeck.exe -> <repo>/.claude/lw-agents.json (legacy source)
 fn parse_source(text: &str) -> Option<Vec<Agent>> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let updated = v.get("updated").and_then(|u| u.as_u64());
@@ -192,8 +203,11 @@ fn parse_source(text: &str) -> Option<Vec<Agent>> {
         status: s(a, "status").to_lowercase(),
         step: s(a, "step"),
         studio: a.get("studio").and_then(|x| x.as_str()).map(|x| x.to_lowercase().trim_end_matches(".rbxl").to_string()).filter(|x| !x.is_empty()),
-        updated,
+        updated: a.get("at").and_then(|x| x.as_u64()).or(updated),
         waiting_on: s(a, "waitingOn"),
+        app: s(a, "app"),
+        progress: a.get("progress").and_then(|x| x.as_f64()).map(|p| if p > 1.0 { p / 100.0 } else { p }.clamp(0.0, 1.0)),
+        window: s(a, "window").to_lowercase(),
         since: 0,
         resolve_on: s(a, "resolveOn"),
         resolved: s(a, "resolved"),
@@ -268,13 +282,48 @@ impl Status {
     // Best agent for a tile: fresh before stale, then running > blocked > failed > anything else.
     fn for_tile(&self, place: &str, title: &str) -> Option<(&Agent, bool, usize)> {
         let now = now_ms();
-        let rank = |s: &str| match s { "running" => 0, "blocked" | "waiting" => 1, "failed" | "error" => 2, _ => 3 };
         let mut m: Vec<(&Agent, bool)> = self.agents.iter()
             .filter(|a| Self::matches(a, place, title))
             .map(|a| (a, a.updated.is_some_and(|u| now.saturating_sub(u) >= STALE_MS))).collect();
         m.sort_by_key(|(a, stale)| (*stale, rank(&a.status)));
         m.first().map(|&(a, s)| (a, s, m.len() - 1))
     }
+}
+
+// Music / modelling apps whose running agents show the deck even below MIN_STUDIOS (entry updated within SHOW_APP_MS).
+const SHOW_APPS: [&str; 2] = ["blender", "lmms"];
+const SHOW_APP_MS: u64 = 10 * 60 * 1000;
+fn app_shows(a: &Agent, now: u64) -> bool {
+    let app = a.app.to_lowercase();
+    a.status == "running" && SHOW_APPS.iter().any(|s| app.contains(s)) && a.updated.is_none_or(|u| now.saturating_sub(u) < SHOW_APP_MS)
+}
+fn rank(s: &str) -> u8 { match s { "running" => 0, "blocked" | "waiting" => 1, "failed" | "error" => 2, _ => 3 } }
+
+// ---------- apps panel ----------
+// APPS: right-hand column for every fresh status entry that names an "app" (Blender, LMMS, any MCP server), one card
+// per app: live DWM thumbnail of that app's window when open, then a row per agent (dot, name · step, progress bar).
+struct Group { key: String, label: String, agents: Vec<Agent>, src: HWND, thumb: isize, aspect: f64 }
+const APPS_W: i32 = 320;
+const MUSIC_CARD: i32 = 300; // the music view's target card width
+enum MItem { Game(String), Agent(String), Track(usize) }
+const GRID_CARD: i32 = 240; // the gallery grid's target card width (columns are fitted to the window)
+const ROW_H: i32 = 26;
+
+// Visible, un-minimised top-level windows: (hwnd, lowercase exe file name, client area).
+fn top_windows(skip: HWND) -> Vec<(HWND, String, i64)> {
+    unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> BOOL {
+        let v = unsafe { &mut *(lp as *mut Vec<HWND>) };
+        if unsafe { IsWindowVisible(h) != 0 && IsIconic(h) == 0 && GetWindow(h, GW_OWNER).is_null() && GetWindowTextLengthW(h) > 0
+            && GetWindowLongPtrW(h, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW == 0 } { v.push(h) }
+        1
+    }
+    let mut all: Vec<HWND> = Vec::new();
+    unsafe { EnumWindows(Some(cb), &mut all as *mut _ as LPARAM) };
+    all.into_iter().filter(|&h| h != skip).map(|h| {
+        let mut r: RECT = unsafe { zeroed() };
+        unsafe { GetClientRect(h, &mut r) };
+        (h, process_path(window_pid(h)).to_lowercase().rsplit('\\').next().unwrap_or("").to_string(), r.right as i64 * r.bottom as i64)
+    }).collect()
 }
 
 fn dot_color(status: &str) -> u32 {
@@ -293,12 +342,70 @@ fn write_status(args: &[String]) -> Result<(), String> {
     let agents: serde_json::Value = serde_json::from_str(agents.trim_start_matches('\u{feff}')).map_err(|e| format!("bad agents json: {e}"))?;
     if !agents.is_array() { return Err("agents must be a JSON array".into()) }
     let doc = serde_json::json!({ "session": session, "project": project, "updated": now_ms(), "agents": agents });
-    let dir = status_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let file: String = session.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-    let tmp = dir.join(format!("{file}.json.tmp"));
+    write_session(session, &doc)
+}
+fn session_path(session: &str) -> PathBuf {
+    status_dir().join(format!("{}.json", session.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect::<String>()))
+}
+fn write_session(session: &str, doc: &serde_json::Value) -> Result<(), String> {
+    let path = session_path(session);
+    std::fs::create_dir_all(status_dir()).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, doc.to_string()).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, dir.join(format!("{file}.json"))).map_err(|e| e.to_string())
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+// --mcp-hook: Claude Code hook (event JSON on stdin), no agent cooperation needed. PreToolUse on mcp__<server>__<tool>
+// upserts entry {app: server, step: tool, status: running} in status/mcp-<session>.json; Stop marks the session done.
+// ponytail: read-modify-write without a lock; two parallel tool calls in one session can drop a step (next call fixes it).
+fn mcp_hook() -> Result<(), String> {
+    let text = std::io::read_to_string(std::io::stdin()).map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
+    // Music an agent made or used -> music gallery, credited to the session (and subagent) that touched it first
+    if s("hook_event_name") == "PostToolUse" {
+        let mut found = Vec::new();
+        music::paths_in(&v["tool_input"], &mut found);
+        music::paths_in(&v["tool_response"], &mut found);
+        if found.is_empty() { return Ok(()) }
+        let mut agent = music::title_of(std::path::Path::new(&s("transcript_path")));
+        if let Some(sub) = v["agent_type"].as_str() { agent = format!("{agent} \u{00B7} {sub}") }
+        return music::record(&found, &agent, now_ms());
+    }
+    // Images shown in chat -> gallery (SendUserFile files, or an image file Claude Reads)
+    if let t @ ("Read" | "SendUserFile") = s("tool_name").as_str() {
+        let cwd = PathBuf::from(s("cwd"));
+        let input = &v["tool_input"];
+        let files: Vec<&str> = if t == "Read" { input["file_path"].as_str().into_iter().collect() }
+            else { input["files"].as_array().into_iter().flatten().filter_map(|f| f.as_str()).collect() };
+        for f in files { gallery::add(&cwd.join(f))? }
+        return Ok(());
+    }
+    let session = format!("mcp-{}", s("session_id"));
+    let mut doc = std::fs::read_to_string(session_path(&session)).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+    let now = now_ms();
+    if s("hook_event_name") == "Stop" {
+        let Some(doc) = doc.as_mut() else { return Ok(()) };
+        for a in doc["agents"].as_array_mut().into_iter().flatten() { a["status"] = "done".into(); a["at"] = now.into() }
+        doc["updated"] = now.into();
+        return write_session(&session, doc);
+    }
+    let tool = s("tool_name");
+    let Some((server, step)) = tool.strip_prefix("mcp__").map(|t| t.split_once("__").unwrap_or((t, ""))) else { return Ok(()) };
+    if server.starts_with("ccd_") || server == "visualize" { return Ok(()) } // the desktop app's own UI servers
+    let project = std::path::Path::new(&s("cwd")).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let doc = doc.get_or_insert_with(|| serde_json::json!({ "session": session, "project": project, "agents": [] }));
+    if !doc["agents"].is_array() { doc["agents"] = serde_json::json!([]) }
+    let list = doc["agents"].as_array_mut().unwrap();
+    let i = list.iter().position(|a| a["app"] == server).unwrap_or_else(|| { list.push(serde_json::json!({ "app": server, "calls": 0 })); list.len() - 1 });
+    let a = &mut list[i];
+    a["name"] = project.into();
+    a["status"] = "running".into();
+    a["step"] = step.replace('_', " ").into();
+    a["at"] = now.into();
+    a["calls"] = (a["calls"].as_u64().unwrap_or(0) + 1).into();
+    doc["updated"] = now.into();
+    write_session(&session, doc)
 }
 
 fn install(on: bool) -> Result<(), String> {
@@ -320,7 +427,7 @@ fn install(on: bool) -> Result<(), String> {
 // slot = target top-left of the card, cur = animated top-left, toff = thumbnail rect relative to the card.
 struct Tile { src: HWND, thumb: isize, place: String, title: String, ram_gb: f64, minimized: bool, aspect: f64,
     slot: (f64, f64), cur: (f64, f64), placed: bool, lift: f64, toff: (f64, f64, f64, f64), paused: bool,
-    local: bool, toast: Option<(String, u32, u64)>,
+    muted: bool, local: bool, toast: Option<(String, u32, u64)>,
     sx: Spring, sy: Spring, sc: Spring, due: Option<(Instant, (f64, f64))> } // cur/lift mirror the springs; due = staggered retarget
 
 // Damped spring (unit mass), semi-implicit Euler. k stiffness, d damping = 2·ζ·√k.
@@ -475,8 +582,8 @@ fn place_name(title: &str) -> String {
 struct Drag { src: HWND, down: (i32, i32), grab: (f64, f64), moved: bool, samples: std::collections::VecDeque<(Instant, f64, f64)> }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Act { Save, Publish, Pause, Close }
-const BAR: [Act; 4] = [Act::Save, Act::Publish, Act::Pause, Act::Close];
+enum Act { Save, Publish, Mute, Pause, Close }
+const BAR: [Act; 5] = [Act::Save, Act::Publish, Act::Mute, Act::Pause, Act::Close];
 // Hover bar of tile `tile` in deck client coords; confirm = it is showing "<act> <place>?" [Cancel] [OK].
 struct Bar { tile: usize, pill: RECT, btns: Vec<RECT>, confirm: Option<Act>, label: String }
 fn inside(r: &RECT, x: i32, y: i32) -> bool { x >= r.left && x < r.right && y >= r.top && y < r.bottom }
@@ -494,6 +601,18 @@ struct App {
     tip_want: Option<(String, RECT, (i32, i32))>, tip: Option<(String, RECT)>,
     // shown = the user opened it (--show, shortcut) or touched it (click, drag, resize): stays up until closed.
     shown: bool, back: (HBITMAP, i32, i32), trace: Option<std::fs::File>,
+    groups: Vec<Group>,
+    // ZOOM: the DWM thumbnail (Studio tile or app window) shown enlarged over the whole deck; collapsed = app cards
+    // folded to their header row.
+    zoom: Option<isize>, collapsed: std::collections::HashSet<String>,
+    // GALLERY (view open = gallery): gal = images newest first, gal_i = selected, gal_seen = newest ms already viewed;
+    // thumbs / big = decoded HBITMAPs (w, h) from the gallery worker; asked = requests in flight or done.
+    // grid = the gallery shows the grid of all images (else the big view); gal_top = the grid's scroll in px.
+    grid: bool, gal_top: i32,
+    // MUSIC view (open = music): tracks from music.rs, scrolled by mus_top; playing = the track MCI is playing.
+    music: bool, tracks: Vec<music::Track>, tracks_at: Option<SystemTime>, mus_top: i32, playing: Option<PathBuf>,
+    gallery: bool, gal: Vec<PathBuf>, gal_i: usize, gal_seen: u64, thumbs: HashMap<PathBuf, (HBITMAP, i32, i32)>,
+    big: Option<(PathBuf, HBITMAP, i32, i32)>, asked: std::collections::HashSet<(PathBuf, bool)>, gal_tx: std::sync::mpsc::Sender<(PathBuf, (u32, u32), bool)>,
 }
 const WATCH_TIMER: usize = 3;
 const TIP_TIMER: usize = 4;
@@ -511,6 +630,8 @@ const H_PIN: u8 = 2;
 const H_UPD: u8 = 3;
 const H_LATER: u8 = 4;
 const H_DO: u8 = 5;
+const H_GAL: u8 = 6;
+const H_MUS: u8 = 7;
 
 thread_local! { static APP: std::cell::Cell<*mut App> = const { std::cell::Cell::new(null_mut()) }; }
 fn app() -> &'static mut App { unsafe { &mut *APP.get() } }
@@ -544,14 +665,21 @@ impl App {
         let min = min_studios();
         // A window the user opened or touched stays until closed. An auto-shown one hides below `min` Studios,
         // unless an agent is waiting or a toast is up.
-        let stay = self.visible && (self.status.agents.iter().any(|a| is_waiting(&a.status)) || self.tiles.iter().any(|t| t.toast.is_some()));
-        if found.len() < min { self.dismissed = false }
-        let want = want_visible(found.len(), min, self.force || self.shown, stay, self.dismissed);
+        let stay = self.visible && (self.status.agents.iter().any(|a| is_waiting(&a.status)) || self.tiles.iter().any(|t| t.toast.is_some())
+            || self.groups.iter().any(|g| g.agents.iter().any(|a| a.status == "running")));
+        // Exception to the 2-Studio rule: an agent is making music or a model right now (until the user closes the deck).
+        self.status.refresh();
+        let now = now_ms();
+        let live = self.status.agents.iter().any(|a| app_shows(a, now));
+        if found.len() < min && !live { self.dismissed = false }
+        let want = want_visible(found.len(), min, self.force || self.shown, stay, self.dismissed) || (live && !self.dismissed);
         if want != self.visible { self.set_visible(want) }
         if !self.visible { return }
         let new_studio = found.iter().any(|h| !self.tiles.iter().any(|t| t.src == *h));
         self.apply_topmost(new_studio, &found);
-        self.status.refresh();
+        self.refresh_groups();
+        self.refresh_gallery();
+        self.refresh_music();
         self.tiles.retain(|t| {
             let keep = found.contains(&t.src);
             if !keep { unsafe { DwmUnregisterThumbnail(t.thumb) }; }
@@ -563,7 +691,7 @@ impl App {
             let mut thumb = 0;
             if unsafe { DwmRegisterThumbnail(self.hwnd, h, &mut thumb) } == 0 {
                 self.tiles.push(Tile { src: h, thumb, place: String::new(), title: String::new(), ram_gb: 0.0, minimized: false, aspect: 1.6,
-                    slot: (0.0, 0.0), cur: (0.0, 0.0), placed: false, lift: 0.0, toff: (0.0, 0.0, 0.0, 0.0), paused: false, local: false, toast: None,
+                    slot: (0.0, 0.0), cur: (0.0, 0.0), placed: false, lift: 0.0, toff: (0.0, 0.0, 0.0, 0.0), paused: false, muted: audio::is_muted(window_pid(h)), local: false, toast: None,
                     sx: Spring::default(), sy: Spring::default(), sc: Spring { pos: 1.0, target: 1.0, ..Default::default() }, due: None });
             }
         }
@@ -578,6 +706,7 @@ impl App {
             t.title = window_title(t.src);
             t.place = place_name(&t.title);
             t.paused = is_paused(&place_key(&t.place));
+            if t.muted { audio::set_muted(window_pid(t.src), true) } // sessions Studio opened since
             t.local = is_local(&t.title);
             if t.toast.as_ref().is_some_and(|x| now_ms() > x.2) { t.toast = None }
             t.ram_gb = working_set_gb(t.src);
@@ -592,7 +721,13 @@ impl App {
             let key = |t: &Tile| (order.iter().position(|o| *o == t.title).unwrap_or(usize::MAX), t.place.to_lowercase());
             self.tiles.sort_by_cached_key(key);
         }
-        self.layout(false);
+        if self.gallery || self.music {
+            // a gallery covers the tiles: only the header's numbers change each second (closing it lays the tiles out)
+            let mut r: RECT = unsafe { zeroed() };
+            unsafe { GetClientRect(self.hwnd, &mut r) };
+            r.bottom = self.px(HEADER);
+            unsafe { InvalidateRect(self.hwnd, &r, 0) };
+        } else { self.layout(false) }
     }
 
     // TOPMOST (setting "topmost", default on): kept above Studio without taking focus; dropped while a Studio modal is
@@ -636,20 +771,182 @@ impl App {
                 ShowWindow(self.overlay, SW_HIDE);
                 (self.drag, self.hover, self.hot, self.confirm) = (None, None, None, None);
                 for t in self.tiles.drain(..) { DwmUnregisterThumbnail(t.thumb); }
+                for g in self.groups.drain(..) { if g.thumb != 0 { DwmUnregisterThumbnail(g.thumb); } }
             }
         }
+    }
+
+    // Rebuilds the apps panel from fresh entries with an "app"; keeps a group's thumbnail while its window is the same.
+    fn refresh_groups(&mut self) {
+        let now = now_ms();
+        let mut groups: Vec<Group> = Vec::new();
+        for a in self.status.agents.iter().filter(|a| !a.app.is_empty() && a.updated.is_none_or(|u| now.saturating_sub(u) < STALE_MS)) {
+            let key = a.app.to_lowercase();
+            match groups.iter_mut().find(|g| g.key == key) {
+                Some(g) => g.agents.push(a.clone()),
+                None => groups.push(Group { key, label: a.app.clone(), agents: vec![a.clone()], src: null_mut(), thumb: 0, aspect: 16.0 / 9.0 }),
+            }
+        }
+        groups.sort_by(|a, b| a.key.cmp(&b.key));
+        let wins = if groups.is_empty() { Vec::new() } else { top_windows(self.hwnd) };
+        for g in &mut groups {
+            g.agents.sort_by_key(|a| (rank(&a.status), std::cmp::Reverse(a.updated)));
+            let exe = g.agents.iter().find(|a| !a.window.is_empty()).map(|a| a.window.clone())
+                .unwrap_or_else(|| g.key.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or("").to_string());
+            g.src = wins.iter().filter(|w| !exe.is_empty() && w.1.contains(&exe)).max_by_key(|w| w.2).map_or(null_mut(), |w| w.0);
+            if g.src.is_null() { continue }
+            let mut rc: RECT = unsafe { zeroed() };
+            unsafe { GetClientRect(g.src, &mut rc) };
+            if rc.right > 0 && rc.bottom > 0 { g.aspect = rc.right as f64 / rc.bottom as f64 }
+            if let Some(o) = self.groups.iter_mut().find(|o| o.key == g.key && o.src == g.src && o.thumb != 0) { g.thumb = std::mem::take(&mut o.thumb) }
+            else if unsafe { DwmRegisterThumbnail(self.hwnd, g.src, &mut g.thumb) } != 0 { g.thumb = 0 }
+        }
+        for o in &self.groups { if o.thumb != 0 { unsafe { DwmUnregisterThumbnail(o.thumb) }; } }
+        self.groups = groups;
+    }
+    // Re-lists the gallery (a few dozen names); keeps the selected image selected and frees bitmaps of pruned ones.
+    fn refresh_gallery(&mut self) {
+        let list = gallery::list();
+        if list == self.gal { return }
+        let cur = self.gal.get(self.gal_i).cloned();
+        self.thumbs.retain(|p, (b, _, _)| { let keep = list.contains(p); if !keep { unsafe { DeleteObject(*b) }; } keep });
+        self.asked.retain(|(p, _)| list.contains(p));
+        self.gal_i = cur.and_then(|c| list.iter().position(|p| *p == c)).unwrap_or(0);
+        self.gal = list;
+        if self.gallery { self.gal_seen = self.gal.first().map_or(0, |p| gallery::parts(p).1) }
+        if self.gal.is_empty() && self.gallery { self.set_gallery(false) } else if self.gallery { self.gal_request() }
+    }
+    fn set_gallery(&mut self, on: bool) {
+        self.gallery = on && !self.gal.is_empty();
+        self.gal_seen = self.gal.first().map_or(0, |p| gallery::parts(p).1);
+        if self.gallery { (self.zoom, self.grid) = (None, true); self.gal_show() }
+        else if let Some((p, b, _, _)) = self.big.take() { unsafe { DeleteObject(b) }; self.asked.remove(&(p, true)); }
+        self.apply_thumbs();
+    }
+    fn gal_go(&mut self, i: isize) {
+        self.gal_i = i.clamp(0, self.gal.len() as isize - 1) as usize;
+        self.gal_show();
+    }
+    // After the selection or view changed: keep the selection in sight on the grid, decode what's now visible, repaint.
+    fn gal_show(&mut self) {
+        if self.grid {
+            let (area, content, cols, _) = self.grid_layout();
+            let ((_, ch), gap) = self.grid_cell(cols);
+            let y = (self.gal_i / cols) as i32 * (ch + gap);
+            let h = area.bottom - area.top;
+            self.gal_top = self.gal_top.min(y).max(y + ch - h).clamp(0, (content - h).max(0));
+        }
+        self.gal_request();
+        unsafe { InvalidateRect(self.hwnd, null(), 0) };
+    }
+    fn gal_scroll(&mut self, rows: i32) {
+        let (area, content, cols, _) = self.grid_layout();
+        let ((_, ch), gap) = self.grid_cell(cols);
+        self.gal_top = (self.gal_top + rows * (ch + gap)).clamp(0, (content - (area.bottom - area.top)).max(0));
+        self.gal_request();
+        unsafe { InvalidateRect(self.hwnd, null(), 0) };
+    }
+    fn grid_area(&self) -> RECT {
+        let mut cr: RECT = unsafe { zeroed() };
+        unsafe { GetClientRect(self.hwnd, &mut cr) };
+        RECT { left: self.px(16), top: self.px(self.header_h()), right: cr.right - self.px(16), bottom: cr.bottom - self.px(16) }
+    }
+    // Card size (w, h) and gap for `cols` columns across the grid area.
+    fn grid_cell(&self, cols: usize) -> ((i32, i32), i32) {
+        let (a, gap) = (self.grid_area(), self.px(10));
+        let cw = (a.right - a.left - gap * (cols as i32 - 1)) / cols as i32;
+        ((cw, cw * 10 / 16), gap)
+    }
+    // Grid view: area, content height, columns, and the cards (index, rect) that are at least partly in sight.
+    fn grid_layout(&self) -> (RECT, i32, usize, Vec<(usize, RECT)>) {
+        let a = self.grid_area();
+        let gap = self.px(10);
+        let cols = ((a.right - a.left + gap) / (self.px(GRID_CARD) + gap)).max(1) as usize;
+        let ((cw, ch), _) = self.grid_cell(cols);
+        let n = self.gal.len();
+        let content = n.div_ceil(cols) as i32 * (ch + gap) - gap;
+        let cells = (0..n).filter_map(|i| {
+            let (x, y) = (a.left + (i % cols) as i32 * (cw + gap), a.top + (i / cols) as i32 * (ch + gap) - self.gal_top);
+            (y + ch > a.top && y < a.bottom).then_some((i, RECT { left: x, top: y, right: x + cw, bottom: y + ch }))
+        }).collect();
+        (a, content, cols, cells)
+    }
+    // Asks the worker for the selected image (at the big view's size: repaints are then a plain copy) and the filmstrip's thumbnails not decoded yet.
+    fn gal_request(&mut self) {
+        let mut want: Vec<(PathBuf, (u32, u32), bool)> = Vec::new();
+        let thumb = (self.px(GRID_CARD + 80) as u32, self.px((GRID_CARD + 80) * 10 / 16) as u32); // one size for grid cards and filmstrip
+        let cells = if self.grid { self.grid_layout().3 } else {
+            let (main, strip) = self.gal_layout();
+            if let Some(p) = self.gal.get(self.gal_i) && self.big.as_ref().is_none_or(|b| b.0 != *p) { want.push((p.clone(), ((main.right - main.left).max(1) as u32, (main.bottom - main.top).max(1) as u32), true)) }
+            strip
+        };
+        for (i, _) in cells { if !self.thumbs.contains_key(&self.gal[i]) { want.push((self.gal[i].clone(), thumb, false)) } }
+        for (p, fit, big) in want { if self.asked.insert((p.clone(), big)) { let _ = self.gal_tx.send((p, fit, big)); } }
+    }
+    fn gal_decoded(&mut self) {
+        let done = std::mem::take(&mut *gallery::DONE.lock().unwrap());
+        for d in done {
+            let bmp = d.bmp as HBITMAP;
+            if !d.big { self.thumbs.insert(d.path, (bmp, d.w, d.h)); continue }
+            self.asked.remove(&(d.path.clone(), true));
+            if self.gallery && self.gal.get(self.gal_i) == Some(&d.path) {
+                if let Some((p, b, _, _)) = self.big.replace((d.path, bmp, d.w, d.h)) { unsafe { DeleteObject(b) }; self.asked.remove(&(p, true)); }
+                self.asked.insert((self.big.as_ref().unwrap().0.clone(), true));
+            } else if !bmp.is_null() { unsafe { DeleteObject(bmp) }; }
+        }
+        if self.gallery { unsafe { InvalidateRect(self.hwnd, null(), 0) }; }
+    }
+    // Big view (above a caption line) and the filmstrip cells (index, rect), centred on the selection.
+    fn gal_layout(&self) -> (RECT, Vec<(usize, RECT)>) {
+        let mut cr: RECT = unsafe { zeroed() };
+        unsafe { GetClientRect(self.hwnd, &mut cr) };
+        let (cw, ch, gap) = (self.px(132), self.px(80), self.px(10));
+        let bottom = cr.bottom - self.px(16);
+        let n = self.gal.len();
+        let k = (((cr.right - self.px(32) + gap) / (cw + gap)).max(1) as usize).min(n);
+        let start = self.gal_i.saturating_sub(k / 2).min(n - k);
+        let x0 = (cr.right - (k as i32 * (cw + gap) - gap)) / 2;
+        let strip = (0..k).map(|j| (start + j, RECT { left: x0 + j as i32 * (cw + gap), top: bottom - ch, right: x0 + j as i32 * (cw + gap) + cw, bottom })).collect();
+        (RECT { left: self.px(16), top: self.px(self.header_h()), right: cr.right - self.px(16), bottom: bottom - ch - self.px(44) }, strip)
+    }
+    fn apps_w(&self) -> i32 { if self.groups.is_empty() { 0 } else { self.px(APPS_W) } }
+    // Per group: card rect, thumbnail rect (if its window is open), top of the first agent row.
+    fn group_rects(&self) -> Vec<(RECT, Option<RECT>, i32)> {
+        let mut cr: RECT = unsafe { zeroed() };
+        unsafe { GetClientRect(self.hwnd, &mut cr) };
+        let (l, r) = (cr.right - self.apps_w(), cr.right - self.px(16));
+        let (il, ir) = (l + self.px(12), r - self.px(12));
+        let mut y = self.px(self.header_h());
+        self.groups.iter().map(|g| {
+            let top = y;
+            y += self.px(36);
+            let open = !self.collapsed.contains(&g.key);
+            let thumb = (open && g.thumb != 0).then(|| {
+                let h = (((ir - il) as f64 / g.aspect) as i32).min(self.px(180));
+                let w = (h as f64 * g.aspect) as i32;
+                let t = RECT { left: il + (ir - il - w) / 2, top: y, right: il + (ir - il - w) / 2 + w, bottom: y + h };
+                y += h + self.px(8);
+                t
+            });
+            let rows = y;
+            if open { y += self.px(ROW_H) * g.agents.len() as i32 + self.px(8) }
+            let card = RECT { left: l, top, right: r, bottom: y };
+            y += self.px(12);
+            (card, thumb, rows)
+        }).collect()
     }
 
     // Auto grid: try every column count, keep the one that gives the biggest thumbnails.
     // Sets each tile's slot; snap = jump there (resize), otherwise glide.
     fn layout(&mut self, snap: bool) {
+        if self.zoom.is_some_and(|z| !self.tiles.iter().any(|t| t.thumb == z) && !self.groups.iter().any(|g| g.thumb == z)) { self.zoom = None } // window gone
         let mut cr: RECT = unsafe { zeroed() };
         unsafe { GetClientRect(self.hwnd, &mut cr) };
         let n = self.tiles.len();
-        if n == 0 { unsafe { InvalidateRect(self.hwnd, null(), 0) }; return }
+        if n == 0 { self.apply_thumbs(); return }
         let (g, pad, cap) = (self.pxf(16.0), self.pxf(8.0), self.pxf(48.0 + 18.0 * self.extra_line() as i32 as f64));
         let top = self.pxf(self.header_h() as f64 - 8.0); // header replaces most of the top gutter
-        let (cw, ch) = (cr.right as f64, cr.bottom as f64 - top);
+        let (cw, ch) = ((cr.right - self.apps_w()) as f64, cr.bottom as f64 - top);
         let aspect = self.tiles.iter().map(|t| t.aspect).sum::<f64>() / n as f64;
         let fit = |w: f64, h: f64, a: f64| { let w2 = w.min(h * a).max(0.0); (w2, w2 / a) };
         let cell = |cols: usize| {
@@ -700,6 +997,16 @@ impl App {
 
     // Pushes thumbnail rects/opacity to DWM; the lifted tile stays opaque and the others dim slightly.
     // dirty = only that client rect is repainted (animation frames), else the whole window.
+    // Enlarged view: the client area under the header, fitted to `aspect`.
+    fn zoom_rect(&self, aspect: f64) -> RECT {
+        let mut cr: RECT = unsafe { zeroed() };
+        unsafe { GetClientRect(self.hwnd, &mut cr) };
+        let (l, t, r, b) = (self.px(16), self.px(self.header_h()), cr.right - self.px(16), cr.bottom - self.px(16));
+        let w = ((r - l) as f64).min((b - t) as f64 * aspect) as i32;
+        let h = (w as f64 / aspect) as i32;
+        RECT { left: l + (r - l - w) / 2, top: t + (b - t - h) / 2, right: l + (r - l - w) / 2 + w, bottom: t + (b - t - h) / 2 + h }
+    }
+    fn set_zoom(&mut self, z: Option<isize>) { self.zoom = z; self.apply_thumbs() }
     fn apply_thumbs_in(&self, dirty: Option<RECT>) {
         let top = self.tiles.iter().map(|t| t.lift).fold(0.0, f64::max).min(1.0);
         for t in &self.tiles {
@@ -710,7 +1017,20 @@ impl App {
                 rcDestination: Self::rect(x + t.toff.0 * s, y + t.toff.1 * s, t.toff.2 * s, t.toff.3 * s),
                 rcSource: unsafe { zeroed() }, opacity: ((if t.paused { 160.0 } else { 255.0 }) - dim) as u8, fVisible: 1, fSourceClientAreaOnly: 1,
             };
+            let mut p = p;
+            if let Some(z) = self.zoom { (p.rcDestination, p.opacity, p.fVisible) = (self.zoom_rect(t.aspect), 255, (z == t.thumb) as BOOL) }
+            if self.gallery || self.music { p.fVisible = 0 }
             unsafe { DwmUpdateThumbnailProperties(t.thumb, &p) };
+        }
+        for (g, (card, thumb, _)) in self.groups.iter().zip(self.group_rects()) {
+            if g.thumb == 0 { continue }
+            let mut p = DWM_THUMBNAIL_PROPERTIES {
+                dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_SOURCECLIENTAREAONLY,
+                rcDestination: thumb.unwrap_or(card), rcSource: unsafe { zeroed() }, opacity: 255, fVisible: thumb.is_some() as BOOL, fSourceClientAreaOnly: 1,
+            };
+            if let Some(z) = self.zoom { (p.rcDestination, p.fVisible) = (self.zoom_rect(g.aspect), (z == g.thumb) as BOOL) }
+            if self.gallery || self.music { p.fVisible = 0 }
+            unsafe { DwmUpdateThumbnailProperties(g.thumb, &p) };
         }
         unsafe { InvalidateRect(self.hwnd, dirty.as_ref().map_or(null(), |r| r as *const RECT), 0) };
         self.render_overlay();
@@ -738,7 +1058,7 @@ impl App {
 
     // Pill centred near the bottom of the hovered tile's thumbnail: 4 icon buttons, or a confirm prompt.
     fn bar(&self) -> Option<Bar> {
-        if self.dragging().is_some() { return None }
+        if self.dragging().is_some() || self.zoom.is_some() || self.gallery || self.music { return None }
         let i = self.hover?;
         let t = self.tiles.get(i)?;
         let (x, y, s) = self.card_rect(t);
@@ -749,7 +1069,7 @@ impl App {
         let name = t.place.trim_end_matches(".rbxl");
         let label = match confirm { Some(Act::Publish) => format!("Publish {name} to Roblox?"), Some(_) => format!("Close {name}?"), None => String::new() };
         let (lead, sizes, gap, inset) = match confirm {
-            None => (pad, vec![h - 2 * pad; 4], self.px(2), pad),
+            None => (pad, vec![h - 2 * pad; BAR.len()], self.px(2), pad),
             Some(a) => {
                 let ok = if a == Act::Publish { "Publish" } else { "Close" };
                 (self.px(16) + self.text_w(&label, self.f_body) + self.px(12),
@@ -822,8 +1142,8 @@ impl App {
             };
             if let Some(b) = &bar { let t = &self.tiles[b.tile]; let pill = pill.unwrap(); match b.confirm {
                 None => for (k, r) in b.btns.iter().enumerate() {
-                    // Segoe MDL2 / Fluent: Save, Upload, Pause|Play, Cancel
-                    let g = match BAR[k] { Act::Save => "\u{E74E}", Act::Publish => "\u{E898}", Act::Pause => if t.paused { "\u{E768}" } else { "\u{E769}" }, Act::Close => "\u{E711}" };
+                    // Segoe MDL2 / Fluent: Save, Upload, Volume|Mute, Pause|Play, Cancel
+                    let g = match BAR[k] { Act::Save => "\u{E74E}", Act::Publish => "\u{E898}", Act::Mute => if t.muted { "\u{E74F}" } else { "\u{E767}" }, Act::Pause => if t.paused { "\u{E768}" } else { "\u{E769}" }, Act::Close => "\u{E711}" };
                     text(g, loc(r), self.f_icon, if t.local && BAR[k] == Act::Publish { DIM } else { TEXT }, DT_CENTER);
                 },
                 Some(a) => {
@@ -867,6 +1187,60 @@ impl App {
         let p = self.pin_btn();
         self.update_label().map(|l| RECT { left: p.left - self.px(8) - self.text_w(&l, self.f_body) - self.px(24), right: p.left - self.px(8), ..p })
     }
+    fn gal_label(&self) -> String { format!("Images  {}", self.gal.len()) }
+    fn gal_new(&self) -> bool { self.gal.first().is_some_and(|p| gallery::parts(p).1 > self.gal_seen) }
+    fn gal_btn(&self) -> Option<RECT> {
+        let p = self.update_btn().unwrap_or(self.pin_btn());
+        (!self.gal.is_empty()).then(|| RECT { left: p.left - self.px(8) - self.text_w(&self.gal_label(), self.f_body) - self.px(24), right: p.left - self.px(8), ..p })
+    }
+    fn mus_label(&self) -> String { format!("Music  {}", self.tracks.len()) }
+    fn mus_btn(&self) -> Option<RECT> {
+        let p = self.gal_btn().or(self.update_btn()).unwrap_or(self.pin_btn());
+        (!self.tracks.is_empty()).then(|| RECT { left: p.left - self.px(8) - self.text_w(&self.mus_label(), self.f_body) - self.px(24), right: p.left - self.px(8), ..p })
+    }
+    // Re-reads the music index when it changed; notices a track that finished playing.
+    fn refresh_music(&mut self) {
+        let at = std::fs::metadata(crate::deck_dir().join("music.json")).and_then(|m| m.modified()).ok();
+        if at != self.tracks_at { (self.tracks, self.tracks_at) = (music::load(), at); if self.music { unsafe { InvalidateRect(self.hwnd, null(), 0) }; } }
+        if self.playing.is_some() && !music::playing() { self.playing = None; unsafe { InvalidateRect(self.hwnd, null(), 0) }; }
+    }
+    fn set_music(&mut self, on: bool) {
+        self.music = on && !self.tracks.is_empty();
+        if self.music { (self.zoom, self.gallery) = (None, false) }
+        self.apply_thumbs();
+    }
+    // Music view: area, content height, and the visible items: game headings, agent sub-headings, track cards.
+    fn music_layout(&self) -> (RECT, i32, Vec<(MItem, RECT)>) {
+        let a = self.grid_area();
+        let gap = self.px(10);
+        let cols = ((a.right - a.left + gap) / (self.px(MUSIC_CARD) + gap)).max(1);
+        let cw = (a.right - a.left - gap * (cols - 1)) / cols;
+        let ch = self.px(54);
+        let (mut y, mut col, mut items) = (0, 0, Vec::new());
+        let mut place = |item: MItem, x: i32, y: i32, w: i32, h: i32| items.push((item, RECT { left: x, top: y, right: x + w, bottom: y + h }));
+        for (i, t) in self.tracks.iter().enumerate() {
+            let prev = i.checked_sub(1).map(|j| &self.tracks[j]);
+            let new_game = prev.is_none_or(|q| q.game != t.game);
+            if new_game || prev.is_some_and(|q| q.agent != t.agent) {
+                if col > 0 { y += ch + gap; col = 0 }
+                if new_game { if i > 0 { y += self.px(10) } place(MItem::Game(t.game.clone()), a.left, y, a.right - a.left, self.px(34)); y += self.px(38) }
+                place(MItem::Agent(t.agent.clone()), a.left, y, a.right - a.left, self.px(24)); y += self.px(28);
+            }
+            place(MItem::Track(i), a.left + col * (cw + gap), y, cw, ch);
+            col += 1;
+            if col == cols { y += ch + gap; col = 0 }
+        }
+        let content = if col > 0 { y + ch } else { y - gap };
+        let (top, bottom) = (a.top, a.bottom);
+        let items = items.into_iter().map(|(it, r)| (it, RECT { top: r.top + top - self.mus_top, bottom: r.bottom + top - self.mus_top, ..r }))
+            .filter(|(_, r)| r.bottom > top && r.top < bottom).collect();
+        (a, content, items)
+    }
+    fn mus_scroll(&mut self, rows: i32) {
+        let (a, content, _) = self.music_layout();
+        self.mus_top = (self.mus_top + rows * self.px(64)).clamp(0, (content - (a.bottom - a.top)).max(0));
+        unsafe { InvalidateRect(self.hwnd, null(), 0) };
+    }
     fn panel_btns(&self) -> (RECT, RECT) {
         let b = self.header_btn();
         let (top, bottom) = (self.px(HEADER + PANEL - 44), self.px(HEADER + PANEL - 16));
@@ -880,6 +1254,8 @@ impl App {
         else if self.update_btn().is_some_and(|r| inside(&r, x, y)) { H_UPD }
         else if self.update_open && self.update_msg.is_empty() && inside(&later, x, y) { H_LATER }
         else if self.update_open && self.update_msg.is_empty() && inside(&doit, x, y) { H_DO }
+        else if self.gal_btn().is_some_and(|r| inside(&r, x, y)) { H_GAL }
+        else if self.mus_btn().is_some_and(|r| inside(&r, x, y)) { H_MUS }
         else { 0 }
     }
     fn all_paused(&self) -> bool { !self.tiles.is_empty() && self.tiles.iter().all(|t| t.paused) }
@@ -937,6 +1313,7 @@ impl App {
         [row(0, 20), row(20, 38), row(38, 56)]
     }
     fn tip_target(&self, x: i32, y: i32) -> Option<(String, RECT)> {
+        if self.gallery || self.music || self.zoom.is_some() { return None }
         let s = |t: &str| t.to_string();
         match self.hdr {
             H_PAUSE => return Some((s(if self.all_paused() { "Let all agents continue" } else { "Pause all agents" }), self.header_btn())),
@@ -954,6 +1331,7 @@ impl App {
                 let text = match BAR[k] {
                     Act::Save => "Save (to Roblox for published places)",
                     Act::Publish => if t.local { "Local file \u{2014} not a published place" } else { "Publish to Roblox \u{2014} updates the existing game" },
+                    Act::Mute => if t.muted { "Unmute this Studio" } else { "Mute this Studio" },
                     Act::Pause => if t.paused { "Let agents continue" } else { "Pause agents on this Studio" },
                     Act::Close => "Close this Studio",
                 };
@@ -1009,6 +1387,12 @@ impl App {
             }
             None => match BAR[k] {
                 Act::Save => { let p = pend(Act::Save); if chord("save", VK_CONTROL, b'S') { self.watch_start(p) } }
+                Act::Mute => {
+                    let on = !self.tiles[b.tile].muted;
+                    audio::set_muted(window_pid(src), on);
+                    self.tiles[b.tile].muted = on;
+                    log(if on { "mute" } else { "unmute" }, &place);
+                }
                 Act::Pause => {
                     if set_paused(&place_key(&place), !paused).is_ok() { self.tiles[b.tile].paused = !paused }
                     log(if paused { "resume" } else { "pause" }, &place);
@@ -1179,10 +1563,39 @@ impl App {
             H_UPD => { self.update_open = !self.update_open; self.update_msg.clear(); return self.layout(false) }
             H_LATER => return self.snooze_update(),
             H_DO => return self.start_update(),
+            H_GAL => { self.music = false; return self.set_gallery(!self.gallery) }
+            H_MUS => return self.set_music(!self.music),
             _ => {}
         }
         if let (Some(b), Some(k)) = (self.bar(), self.hot) { self.press(b, k); return }
         if self.confirm.take().is_some() { self.render_overlay() }
+        if self.music {
+            if let Some((MItem::Track(i), _)) = self.music_layout().2.into_iter().find(|(it, r)| matches!(it, MItem::Track(_)) && inside(r, x, y)) {
+                let p = self.tracks[i].path.clone();
+                if self.playing.as_ref() == Some(&p) { music::stop(); self.playing = None }
+                else { self.playing = music::play(&p).then_some(p) }
+                unsafe { InvalidateRect(self.hwnd, null(), 0) };
+            }
+            return;
+        }
+        if self.gallery && self.grid {
+            if let Some((i, _)) = self.grid_layout().3.into_iter().find(|(_, r)| inside(r, x, y)) { self.grid = false; self.gal_go(i as isize) }
+            return;
+        }
+        if self.gallery {
+            let (main, strip) = self.gal_layout();
+            if let Some(&(i, _)) = strip.iter().find(|(_, r)| inside(r, x, y)) { return self.gal_go(i as isize) }
+            if inside(&main, x, y) { return self.gal_go(self.gal_i as isize + if x < (main.left + main.right) / 2 { -1 } else { 1 }) }
+            return;
+        }
+        // enlarged: any click returns; app card: header folds it, thumbnail enlarges it
+        if self.zoom.is_some() { return self.set_zoom(None) }
+        let hit = self.groups.iter().zip(self.group_rects()).find(|(_, (c, _, _))| inside(c, x, y)).map(|(g, (c, t, _))| (g.key.clone(), g.thumb, y < c.top + self.px(36), t.is_some_and(|t| inside(&t, x, y))));
+        if let Some((key, thumb, head, on_thumb)) = hit {
+            if head { if !self.collapsed.remove(&key) { self.collapsed.insert(key); } return self.apply_thumbs() }
+            if on_thumb { return self.set_zoom(Some(thumb)) }
+            return;
+        }
         let Some(i) = self.hit(x, y) else { return };
         let t = &self.tiles[i];
         self.drag = Some(Drag { src: t.src, down: (x, y), grab: (x as f64 - t.cur.0, y as f64 - t.cur.1), moved: false, samples: Default::default() });
@@ -1322,7 +1735,19 @@ impl App {
                 if n == 1 { "" } else { "s" }, self.pc_mem.0, self.pc_mem.1);
             let pin = self.pin_btn();
             let ub = self.update_btn();
-            text(&summary, RECT { left: self.px(20), top: self.px(4), right: ub.map_or(pin.left, |u| u.left) - self.px(8), bottom: self.px(HEADER) }, self.f_body, MUTED, DT_LEFT | DT_VCENTER);
+            let gb = self.gal_btn();
+            let mb = self.mus_btn();
+            text(&summary, RECT { left: self.px(20), top: self.px(4), right: mb.or(gb).or(ub).map_or(pin.left, |u| u.left) - self.px(8), bottom: self.px(HEADER) }, self.f_body, MUTED, DT_LEFT | DT_VCENTER);
+            if let Some(m) = mb {
+                round(m, match (self.music, self.hdr == H_MUS) { (true, true) => rgb(40, 150, 255), (true, false) => rgb(10, 132, 255), (false, true) => CARD_HOVER, _ => CARD }, m.bottom - m.top);
+                text(&self.mus_label(), m, self.f_body, TEXT, DT_CENTER | DT_VCENTER);
+            }
+            if let Some(g) = gb {
+                // blue while open or holding images not seen yet
+                let lit = self.gallery || self.gal_new();
+                round(g, match (lit, self.hdr == H_GAL) { (true, true) => rgb(40, 150, 255), (true, false) => rgb(10, 132, 255), (false, true) => CARD_HOVER, _ => CARD }, g.bottom - g.top);
+                text(&self.gal_label(), g, self.f_body, TEXT, DT_CENTER | DT_VCENTER);
+            }
             if n > 0 {
                 round(hb, if self.hdr == H_PAUSE { CARD_HOVER } else { CARD }, hb.bottom - hb.top);
                 text(if self.all_paused() { "Resume all" } else { "Pause all" }, hb, self.f_body, TEXT, DT_CENTER | DT_VCENTER);
@@ -1352,8 +1777,124 @@ impl App {
                     text(&self.update_msg, RECT { left: later.left - self.px(160), ..doit }, self.f_body, MUTED, DT_RIGHT | DT_VCENTER);
                 }
             }
+            if self.zoom.is_some() { return } // enlarged thumbnail covers the rest
+            if self.music {
+                let (area, content, items) = self.music_layout();
+                let saved = SaveDC(dc);
+                IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
+                for (it, r) in items {
+                    if RectVisible(dc, &r) == 0 { continue } // outside this repaint (usually just the header's numbers)
+                    match it {
+                        MItem::Game(g) => text(&g, r, self.f_title, TEXT, DT_LEFT | DT_VCENTER),
+                        MItem::Agent(a) => text(&a, r, self.f_body, rgb(120, 180, 255), DT_LEFT | DT_VCENTER),
+                        MItem::Track(i) => {
+                            let t = &self.tracks[i];
+                            let on = self.playing.as_ref() == Some(&t.path);
+                            round(r, if on { rgb(10, 132, 255) } else { CARD }, self.px(8));
+                            let icon = RECT { left: r.left + self.px(8), right: r.left + self.px(36), ..r };
+                            text(if on { "\u{25A0}" } else { "\u{25B6}" }, icon, self.f_title, if on { TEXT } else { rgb(120, 180, 255) }, DT_CENTER | DT_VCENTER);
+                            let name = t.path.file_stem().unwrap_or_default().to_string_lossy().replace('_', " ");
+                            let sub = t.path.parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+                            let (l, rt) = (r.left + self.px(42), r.right - self.px(8));
+                            text(&name, RECT { left: l, top: r.top + self.px(6), right: rt, bottom: r.top + self.px(28) }, self.f_title, TEXT, DT_LEFT | DT_VCENTER);
+                            let when = if t.ms > 0 { format!("   \u{00B7}   {}", local_hhmm(t.ms)) } else { String::new() };
+                            text(&format!("{sub}{when}"), RECT { left: l, top: r.top + self.px(28), right: rt, bottom: r.bottom - self.px(6) }, self.f_body, if on { TEXT } else { MUTED }, DT_LEFT | DT_VCENTER);
+                        }
+                    }
+                }
+                RestoreDC(dc, saved);
+                let h = area.bottom - area.top;
+                if content > h {
+                    let bar = (h * h / content).max(self.px(24));
+                    let y = area.top + ((h - bar) as i64 * self.mus_top as i64 / (content - h).max(1) as i64) as i32;
+                    round(RECT { left: area.right + self.px(5), top: y, right: area.right + self.px(10), bottom: y + bar }, DIM, self.px(4));
+                }
+                return;
+            }
+            if self.gallery {
+                let blit = |bmp: HBITMAP, bw: i32, bh: i32, r: RECT| {
+                    let s = ((r.right - r.left) as f64 / bw as f64).min((r.bottom - r.top) as f64 / bh as f64);
+                    let (w, h) = ((bw as f64 * s) as i32, (bh as f64 * s) as i32);
+                    let (x, y) = (r.left + (r.right - r.left - w) / 2, r.top + (r.bottom - r.top - h) / 2);
+                    let m = CreateCompatibleDC(dc);
+                    let o = SelectObject(m, bmp);
+                    SetStretchBltMode(dc, HALFTONE);
+                    SetBrushOrgEx(dc, 0, 0, null_mut());
+                    StretchBlt(dc, x, y, w, h, m, 0, 0, bw, bh, SRCCOPY);
+                    SelectObject(m, o);
+                    DeleteDC(m);
+                };
+                if self.grid {
+                    let (area, content, _, cells) = self.grid_layout();
+                    let saved = SaveDC(dc);
+                    IntersectClipRect(dc, area.left - self.px(4), area.top, area.right + self.px(4), area.bottom);
+                    for (i, r) in cells {
+                        if RectVisible(dc, &RECT { left: r.left - 4, top: r.top - 4, right: r.right + 4, bottom: r.bottom + 4 }) == 0 { continue }
+                        if i == self.gal_i { round(RECT { left: r.left - self.px(3), top: r.top - self.px(3), right: r.right + self.px(3), bottom: r.bottom + self.px(3) }, rgb(10, 132, 255), self.px(10)) }
+                        round(r, CARD, self.px(8));
+                        match self.thumbs.get(&self.gal[i]) {
+                            Some(&(b, w, h)) if !b.is_null() => blit(b, w, h, RECT { left: r.left + self.px(4), top: r.top + self.px(4), right: r.right - self.px(4), bottom: r.bottom - self.px(4) }),
+                            _ => text("\u{2026}", r, self.f_body, DIM, DT_CENTER | DT_VCENTER),
+                        }
+                    }
+                    RestoreDC(dc, saved);
+                    // scroll position, when there's more than fits
+                    let h = area.bottom - area.top;
+                    if content > h {
+                        let bar = (h * h / content).max(self.px(24));
+                        let y = area.top + ((h - bar) as i64 * self.gal_top as i64 / (content - h).max(1) as i64) as i32;
+                        round(RECT { left: area.right + self.px(5), top: y, right: area.right + self.px(10), bottom: y + bar }, DIM, self.px(4));
+                    }
+                    return;
+                }
+                let (main, strip) = self.gal_layout();
+                let Some(cur) = self.gal.get(self.gal_i) else { return };
+                match (&self.big, self.thumbs.get(cur)) {
+                    (Some((p, b, w, h)), _) if p == cur => blit(*b, *w, *h, main),
+                    (_, Some(&(b, w, h))) if !b.is_null() => blit(b, w, h, main), // until the full one decodes
+                    _ => text("Loading\u{2026}", main, self.f_body, DIM, DT_CENTER | DT_VCENTER),
+                }
+                let (name, ms) = gallery::parts(cur);
+                let cap = RECT { left: main.left, top: main.bottom + self.px(4), right: main.right, bottom: main.bottom + self.px(30) };
+                text(&format!("{name}   \u{00B7}   {}   \u{00B7}   {} / {}   \u{00B7}   Esc: all images", local_hhmm(ms), self.gal_i + 1, self.gal.len()), cap, self.f_body, MUTED, DT_CENTER | DT_VCENTER);
+                for (i, r) in strip {
+                    if i == self.gal_i { round(RECT { left: r.left - self.px(3), top: r.top - self.px(3), right: r.right + self.px(3), bottom: r.bottom + self.px(3) }, rgb(10, 132, 255), self.px(10)) }
+                    round(r, CARD, self.px(8));
+                    if let Some(&(b, w, h)) = self.thumbs.get(&self.gal[i]) && !b.is_null() {
+                        blit(b, w, h, RECT { left: r.left + self.px(4), top: r.top + self.px(4), right: r.right - self.px(4), bottom: r.bottom - self.px(4) });
+                    }
+                }
+                return;
+            }
+            // apps panel
+            for (g, (card, _, rows)) in self.groups.iter().zip(self.group_rects()) {
+                round(card, CARD, self.px(14));
+                let head = RECT { left: card.left + self.px(12), top: card.top + self.px(6), right: card.right - self.px(12), bottom: card.top + self.px(32) };
+                text("\u{25CF}", head, self.f_body, dot_color(&g.agents[0].status), DT_LEFT | DT_VCENTER);
+                let n = g.agents.len();
+                text(&format!("{n} agent{}", if n == 1 { "" } else { "s" }), head, self.f_body, MUTED, DT_RIGHT | DT_VCENTER);
+                text(&g.label, RECT { left: head.left + self.px(16), right: head.right - self.px(64), ..head }, self.f_title, TEXT, DT_LEFT | DT_VCENTER);
+                for (k, a) in g.agents.iter().enumerate().filter(|_| !self.collapsed.contains(&g.key)) {
+                    let y = rows + self.px(ROW_H) * k as i32;
+                    let row = RECT { left: head.left, top: y, right: head.right, bottom: y + self.px(20) };
+                    text("\u{25CF}", row, self.f_body, dot_color(&a.status), DT_LEFT | DT_VCENTER);
+                    let right = match a.progress {
+                        Some(p) => format!("{:.0}%", p * 100.0),
+                        None => { let m = now_ms().saturating_sub(a.updated.unwrap_or(0)) / 60_000; if m == 0 { "now".into() } else { format!("{m}m") } }
+                    };
+                    text(&right, row, self.f_body, DIM, DT_RIGHT | DT_VCENTER);
+                    let what = if is_waiting(&a.status) && !a.waiting_on.is_empty() { format!("Waiting on: {}", a.waiting_on) } else { a.step.clone() };
+                    let s = if what.is_empty() { a.name.clone() } else { format!("{}  \u{00B7}  {what}", a.name) };
+                    text(&s, RECT { left: row.left + self.px(16), right: row.right - self.px(40), ..row }, self.f_body, if a.status == "done" { DIM } else { MUTED }, DT_LEFT | DT_VCENTER);
+                    if let Some(p) = a.progress {
+                        let bar = RECT { left: row.left + self.px(16), top: row.bottom + self.px(1), right: row.right, bottom: row.bottom + self.px(4) };
+                        round(bar, rgb(52, 52, 56), self.px(3));
+                        round(RECT { right: bar.left + ((bar.right - bar.left) as f64 * p) as i32, ..bar }, dot_color(&a.status), self.px(3));
+                    }
+                }
+            }
             if self.tiles.is_empty() {
-                text("No Studios open", cr, self.f_body, MUTED, DT_CENTER | DT_VCENTER);
+                text("No Studios open", RECT { right: cr.right - self.apps_w(), ..cr }, self.f_body, MUTED, DT_CENTER | DT_VCENTER);
                 return;
             }
             let extra = self.extra_line() as i32 * 18;
@@ -1539,6 +2080,38 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             }
             WM_LBUTTONDOWN => { let (x, y) = xy(lp); a.mouse_down(x, y); 0 }
             WM_LBUTTONUP => { let (x, y) = xy(lp); a.mouse_up(x, y); 0 }
+            // right-click a Studio tile: enlarge it (any click or Esc returns)
+            gallery::WM_GALLERY => { a.gal_decoded(); 0 }
+            // grid: arrows move the selection (up/down a row), Enter opens it, wheel scrolls; big view: arrows/wheel step,
+            // Esc back to the grid; Esc on the grid closes the gallery
+            WM_KEYDOWN if a.gallery && [VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_RETURN, VK_ESCAPE, VK_HOME, VK_END].contains(&(wp as u16)) => {
+                let i = a.gal_i as isize;
+                let row = if a.grid { a.grid_layout().2 as isize } else { 1 };
+                match wp as u16 {
+                    VK_ESCAPE if a.grid => a.set_gallery(false),
+                    VK_ESCAPE => { a.grid = true; a.gal_show() }
+                    VK_RETURN => { a.grid = false; a.gal_show() }
+                    VK_LEFT => a.gal_go(i - 1), VK_RIGHT => a.gal_go(i + 1),
+                    VK_UP => a.gal_go(i - row), VK_DOWN => a.gal_go(i + row),
+                    VK_HOME => a.gal_go(0), _ => a.gal_go(isize::MAX),
+                }
+                0
+            }
+            WM_MOUSEWHEEL if a.gallery => {
+                let step = -(((wp >> 16) as i16) as i32).signum();
+                if a.grid { a.gal_scroll(step) } else { a.gal_go(a.gal_i as isize + step as isize) }
+                0
+            }
+            WM_RBUTTONDOWN if a.gallery || a.music => 0,
+            WM_KEYDOWN if a.music && wp as u16 == VK_ESCAPE => { a.set_music(false); 0 }
+            WM_MOUSEWHEEL if a.music => { a.mus_scroll(-(((wp >> 16) as i16) as i32).signum()); 0 }
+            WM_RBUTTONDOWN => {
+                let (x, y) = xy(lp);
+                let z = if a.zoom.is_some() { None } else { a.hit(x, y).map(|i| a.tiles[i].thumb) };
+                a.set_zoom(z);
+                0
+            }
+            WM_KEYDOWN if wp == VK_ESCAPE as usize && a.zoom.is_some() => { a.set_zoom(None); 0 }
             WM_CAPTURECHANGED if a.drag.is_some() => { a.mouse_up(i32::MIN, i32::MIN); 0 }
             WM_MOUSEMOVE => {
                 let (x, y) = xy(lp);
@@ -1630,6 +2203,9 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cli = match args.get(1).map(String::as_str) {
         Some("--status") => Some(write_status(&args[2..])),
+        Some("--mcp-hook") => Some(mcp_hook()),
+        Some("--music-scan") => Some(music::scan()),
+        Some("--image") => Some(args.get(2).ok_or_else(|| "usage: --image <path>".to_string()).and_then(|f| gallery::add(std::path::Path::new(f)))),
         Some("--install") => Some(set_background(true).and_then(|_| install(true))),
         Some("--uninstall") => Some(set_background(false).and_then(|_| install(false))),
         Some("--show-when") => Some(set_show_when(args.get(2))),
@@ -1702,7 +2278,9 @@ fn main() {
             icon_face: pick_face(&["Segoe Fluent Icons", "Segoe MDL2 Assets"]), f_title: null_mut(), f_body: null_mut(), f_icon: null_mut(),
             card: (0.0, 0.0), slots: Vec::new(), drag: None, animating: false, last_frame: Instant::now(), settings,
             overlay, hot: None, hdr: 0, confirm: None, pc_mem: (0.0, 0.0), pending: Vec::new(), shown: force,
-            update: None, update_open: false, update_msg: String::new(), tip_want: None, tip: None, back: (null_mut(), 0, 0),
+            update: None, update_open: false, update_msg: String::new(), tip_want: None, tip: None, back: (null_mut(), 0, 0), groups: Vec::new(), zoom: None, collapsed: Default::default(),
+            music: false, tracks: Vec::new(), tracks_at: None, mus_top: 0, playing: None,
+            grid: true, gal_top: 0, gallery: false, gal: gallery::list(), gal_i: 0, gal_seen: 0, thumbs: HashMap::new(), big: None, asked: Default::default(), gal_tx: gallery::worker(hwnd),
             trace: std::env::var_os("STUDIODECK_TRACE").and_then(|p| std::fs::File::create(p).ok()),
         });
         APP.set(Box::into_raw(boxed));
@@ -1749,6 +2327,18 @@ fn iso_times() {
 #[cfg(test)]
 mod tests {
     use super::want_visible as v;
+    #[test]
+    fn music_and_modelling_show() {
+        let a = |app: &str, status: &str, ago: u64| super::Agent { app: app.into(), status: status.into(), updated: Some(1_000_000_000 - ago),
+            name: String::new(), step: String::new(), studio: None, waiting_on: String::new(), since: 0, resolve_on: String::new(), resolved: String::new(),
+            src: Default::default(), place_id: String::new(), universe: String::new(), progress: None, window: String::new() };
+        let now = 1_000_000_000;
+        assert!(super::app_shows(&a("Blender", "running", 0), now));
+        assert!(super::app_shows(&a("lmms", "running", 60_000), now));
+        assert!(!super::app_shows(&a("lmms", "done", 0), now));             // finished
+        assert!(!super::app_shows(&a("Blender", "running", 11 * 60_000), now)); // gone quiet
+        assert!(!super::app_shows(&a("claude-in-chrome", "running", 0), now)); // not music/modelling
+    }
     #[test]
     fn needs_two_studios() {
         for opened in [false, true] { for stay in [false, true] {
