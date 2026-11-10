@@ -20,9 +20,15 @@ calm window.
   frames); click to bring that Studio forward.
 - **Command center per tile.** Hover a tile for Save, Publish (to the existing experience only — disabled for local
   `.rbxl` files, and any "publish as new game" dialog is cancelled), Pause agents and Close, with in-deck confirms and
-  toasts ("Saved ✓", "Published ✓ 14:02"). Header: Studio count, RAM, Pause all, keep-on-top pin.
+  toasts ("Saved ✓", "Published ✓ 14:02"), plus Mute (that Studio in the Windows mixer). Header: Studio count, RAM,
+  Pause all, keep-on-top pin. Right-click a tile to enlarge it to the whole deck.
 - **Waiting, not idle.** Agents can say what they're waiting on (`waitingOn`) and how it clears itself
   (`resolveOn: published:<universeId>` or `file:<path>`); the tile shows "Waiting on: user: publish · 4m".
+- **Apps panel for agent swarms.** Blender, LMMS or any other app an agent drives gets a card on the right with a live
+  thumbnail of its window and each agent's step and progress bar. A Claude Code hook (`--mcp-hook`) fills it from every
+  MCP tool call automatically. While an agent is working in Blender or LMMS the deck shows even with one Studio open.
+- **Images and Music galleries.** Every image an agent sent or looked at in chat, as a scrolling grid with a big view;
+  every audio file agents made, grouped by game and by agent, with click-to-play.
 - **Focus-free control.** Screenshot a covered Studio window, click, type and scroll in it — without moving your
   cursor or changing the foreground window. Several agents can work in several Studios in parallel.
 - **Never lose a busy plugin.** Studio's "<plugin> is not responding — stop this plugin?" box is answered

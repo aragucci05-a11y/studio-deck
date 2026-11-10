@@ -23,6 +23,27 @@ studiodeck.exe --status <session> <project> '[{"name":"<task>","status":"done","
   - `"resolveOn":"file:<path>"` — that file's modified time passes the start of the wait (build / test output).
 - Optional `"placeId"` / `"universeId"` on an entry let the deck confirm the user's Publish button ("Published ✓").
 
+## Apps panel (Blender, LMMS, any MCP tool or agent workflow)
+Add `"app"` to an entry and it shows in the deck's right-hand Apps panel, one card per app with a live thumbnail of
+that app's window (matched by exe name), instead of on a Studio tile:
+`{"name":"Rocket mesh","app":"Blender","status":"running","step":"bevel + UV","progress":0.6}`
+- `progress`: 0..1 (or 0..100) draws a bar. `window`: exe-name substring for the thumbnail when it differs from the
+  app name's first word (e.g. `"app":"claude-in-chrome","window":"chrome"`).
+- Claude Code sessions report MCP calls automatically: a user-level `PreToolUse` hook (matcher `mcp__.*`) and a
+  `Stop` hook run `studiodeck.exe --mcp-hook`, so every MCP server in use gets a card with the current tool as its
+  step. You don't need to report those yourself; still report the task itself with `--status`.
+
+## Images gallery
+Every image a Claude Code session sends (SendUserFile) or looks at (Read of a .png/.jpg/…) is copied by the same hook
+into the deck's gallery (header button "Images N", newest 200 kept), so deleting your screenshots afterwards is fine.
+Other tools can add one with `studiodeck.exe --image <path>`. It opens on a grid of all of them; click one for the big view.
+
+## Music gallery
+Every audio file (mp3/wav/ogg/flac/m4a) that shows up in a Claude Code tool call's input or output (Bash, PowerShell,
+Write, SendUserFile, LMMS MCP) is indexed by a `PostToolUse` hook, credited to that session's title (and the subagent's
+task description). The deck's "Music N" button lists them by game (the folder under Music\ or Documents\), then by
+agent; click a card to play/stop. `studiodeck.exe --music-scan` re-indexes from all past transcripts (~40 s).
+
 ## Respect "Paused" (before every Studio action batch)
 The user can pause agents per Studio from the deck. Before each batch of actions on a Studio run
 `studiodeck.exe --check <title>`: exit 0 = go; **exit 3 = paused** — stop, report status `waiting` with
