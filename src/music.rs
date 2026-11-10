@@ -1,7 +1,7 @@
 // Music gallery: every audio file a Claude Code session made or used, grouped by game (the folder under Music\ or
 // Documents\) and then by agent (the session's title). Index: %LOCALAPPDATA%\studiodeck\music.json, fed by the hook
 // (--mcp-hook on PostToolUse: paths in the tool's input/output) and backfilled once from the transcripts (--music-scan).
-// Playback is MCI (mp3/wav play in the deck; anything else opens in the default player).
+// Playback is MCI inside the deck (open, play/pause, seek; times in ms); nothing opens another app.
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Media::Multimedia::mciSendStringW;
 
@@ -128,18 +128,27 @@ fn mci(cmd: &str) -> String {
     unsafe { mciSendStringW(crate::w(cmd).as_ptr(), buf.as_mut_ptr(), buf.len() as u32, std::ptr::null_mut()) };
     String::from_utf16_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(0)])
 }
+fn mci_ok(cmd: &str) -> bool {
+    let mut buf = [0u16; 64];
+    unsafe { mciSendStringW(crate::w(cmd).as_ptr(), buf.as_mut_ptr(), buf.len() as u32, std::ptr::null_mut()) == 0 }
+}
 pub fn stop() { mci("close deckmusic"); }
-// Plays in the deck; false (opened in the default player instead) for formats MCI can't play.
+// Opens and plays `p` in the deck; false if Windows can't decode it (then nothing is left open).
 pub fn play(p: &Path) -> bool {
     stop();
-    let mp3wav = p.extension().is_some_and(|x| x.eq_ignore_ascii_case("mp3") || x.eq_ignore_ascii_case("wav"));
-    if mp3wav && mci(&format!("open \"{}\" type mpegvideo alias deckmusic", p.display())).is_empty() && mci("play deckmusic").is_empty() { return true }
-    stop();
-    let (verb, file) = (crate::w("open"), crate::w(&p.to_string_lossy()));
-    unsafe { windows_sys::Win32::UI::Shell::ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1) };
-    false
+    let ok = mci_ok(&format!("open \"{}\" type mpegvideo alias deckmusic", p.display()))
+        && mci_ok("set deckmusic time format milliseconds") && mci_ok("play deckmusic");
+    if !ok { stop() }
+    ok
 }
-pub fn playing() -> bool { mci("status deckmusic mode") == "playing" }
+pub fn mode() -> String { mci("status deckmusic mode") }
+pub fn length() -> u64 { mci("status deckmusic length").trim().parse().unwrap_or(0) }
+pub fn position() -> u64 { mci("status deckmusic position").trim().parse().unwrap_or(0) }
+pub fn pause() { mci("pause deckmusic"); }
+pub fn resume() { mci("play deckmusic"); } // from the current (or last seeked) position
+// Jumps to `ms`; playing carries on from there, otherwise it waits there for resume().
+pub fn seek(ms: u64, play: bool) { mci(&if play { format!("play deckmusic from {ms}") } else { format!("seek deckmusic to {ms}") }); }
+pub fn clock(ms: u64) -> String { format!("{}:{:02}", ms / 60_000, ms / 1000 % 60) }
 
 #[cfg(test)]
 #[test]
@@ -153,3 +162,39 @@ fn finds_paths_and_games() {
     assert_eq!(game_of(Path::new(r"C:\Users\me\Music\x.mp3")), "Other");
 }
 
+
+// Local only (`cargo test -- --ignored`): plays a real mp3 from the user's Music folder at volume 0.
+#[cfg(test)]
+#[test]
+#[ignore]
+fn player_controls() {
+    let music = PathBuf::from(std::env::var("USERPROFILE").unwrap()).join("Music");
+    fn find(d: &Path) -> Option<PathBuf> {
+        for e in std::fs::read_dir(d).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() { if let Some(f) = find(&p) { return Some(f) } } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("mp3")) { return Some(p) }
+        }
+        None
+    }
+    let f = find(&music).expect("an mp3 under Music");
+    assert!(play(&f));
+    mci("setaudio deckmusic volume to 0");
+    let len = length();
+    assert!(len > 2000, "length {len}");
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    assert_eq!(mode(), "playing");
+    assert!(position() > 200, "advancing: {}", position());
+    seek(len / 2, true);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let p = position();
+    assert!(p >= len / 2 && p < len / 2 + 2000, "seeked to {p} of {len}");
+    pause();
+    assert_eq!(mode(), "paused");
+    seek(1000, false);
+    resume();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(position() >= 1000 && position() < 3000, "resumed at {}", position());
+    stop();
+    assert!(!play(Path::new(r"C:\nope\missing.mp3")));
+    eprintln!("{} ok, length {}", f.display(), clock(len));
+}
