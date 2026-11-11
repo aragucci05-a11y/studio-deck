@@ -8,6 +8,11 @@
 // them; click one (or Enter) for the big view + filmstrip, Esc back to the grid.
 // v0.8: Music view has a player bar at the bottom: play/pause, time, and a scrub bar (click or drag to seek). Everything
 // plays inside the deck; a format Windows can't decode says so instead of opening another app.
+// v0.10: a full-screen (maximised) deck stays full screen and stays above every Studio that opens: new Studios are left
+// as they are behind it, and the deck comes back to the front over them for their first minute (no focus taken). It
+// reopens maximised after a restart. Raising uses the topmost toggle, which works even when another app has the focus.
+// v0.9: keeping its space no longer needs the pin: unpinned, the deck moves new Studios aside the same way, raises itself
+// back over a new Studio it still shares space with (no focus taken), and goes on top only while a Studio splash covers it.
 // v0.7: pinned (keep on top), the deck keeps its own space: a Studio window that opens over it (or maximises over it in its
 // first 20 s) is moved beside it, never activated; and the deck re-asserts its place over an always-on-top Studio window.
 // v0.6: the header's update button is always there: "Check for updates" asks GitHub now; a newer release opens the
@@ -606,6 +611,8 @@ struct App {
     checking: bool, uptodate_until: u64,
     // seen = when each Studio window first appeared (0 = already open when the deck started); see make_room
     seen: Option<HashMap<usize, u64>>,
+    // splash_top = unpinned, but on top for now because a Studio loading splash (always-on-top) overlaps the deck
+    splash_top: bool,
     // TOOLTIPS: tip_want = (text, anchor) under the pointer; shown as `tip` (text, label rect) after 500 ms (TIP_TIMER).
     tip_want: Option<(String, RECT, (i32, i32))>, tip: Option<(String, RECT)>,
     // shown = the user opened it (--show, shortcut) or touched it (click, drag, resize): stays up until closed.
@@ -694,7 +701,7 @@ impl App {
         if !self.visible { return }
         let new_studio = found.iter().any(|h| !self.tiles.iter().any(|t| t.src == *h));
         self.apply_topmost(new_studio, &found);
-        if self.topmost_setting() && self.is_top() { self.keep_space(&found, now) }
+        self.keep_space(&found, now);
         self.refresh_groups();
         self.refresh_gallery();
         self.refresh_music();
@@ -759,20 +766,28 @@ impl App {
                 String::from_utf16_lossy(&cls[..n.max(0) as usize]) == "#32770"
             })
         });
-        let want = self.topmost_setting() && !modal;
+        let want = (self.topmost_setting() || self.splash_top) && !modal;
         if want != self.is_top() || (reassert && want) { self.set_top(want) }
     }
-    // PIN keeps the deck's space: Studio windows that appeared in the last 20 s and overlap the deck move beside it (the
-    // wider free side of the deck's monitor, restored first if maximised; nothing is activated). Then, if any visible
-    // always-on-top Studio window (its loading splash) overlaps the deck, the deck goes back to the top of that band.
+    // The deck keeps its space (pinned or not): Studio windows that appeared in the last 20 s and overlap the deck move beside
+    // it (the wider free side of the deck's monitor, restored first if maximised; nothing is activated). Unpinned, a new
+    // Studio that still overlaps (no room beside) gets the deck raised back over it, z-order only. If a visible
+    // always-on-top Studio window (its loading splash) overlaps the deck, the deck goes on top of that band; unpinned only
+    // until the splash is gone.
     fn keep_space(&mut self, studios: &[HWND], now: u64) {
         let rect = |h: HWND| { let mut r: RECT = unsafe { zeroed() }; unsafe { GetWindowRect(h, &mut r) }; r };
         let overlaps = |a: &RECT, b: &RECT| a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
         let deck = rect(self.hwnd);
         let seen = self.seen.as_ref().map(|s| s.clone()).unwrap_or_default();
+        let full = unsafe { IsZoomed(self.hwnd) } != 0;
+        let mut cover = false; // a Studio opened in the last minute shares the deck's space
         for &h in studios {
             let born = seen.get(&(h as usize)).copied().unwrap_or(0);
-            if born == 0 || now.saturating_sub(born) > 20_000 || unsafe { IsIconic(h) } != 0 || !overlaps(&rect(h), &deck) { continue }
+            if born == 0 || unsafe { IsIconic(h) } != 0 || !overlaps(&rect(h), &deck) { continue }
+            let age = now.saturating_sub(born);
+            // full screen: the deck keeps the screen; new Studios stay as they are, behind it
+            if full { cover |= age <= 60_000; continue }
+            if age > 20_000 { continue }
             let mut mi: MONITORINFO = unsafe { zeroed() };
             mi.cbSize = size_of::<MONITORINFO>() as u32;
             unsafe { GetMonitorInfoW(MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) };
@@ -780,16 +795,33 @@ impl App {
             let (left, right) = (deck.left - wa.left, wa.right - deck.right);
             let gap = self.px(8);
             let (x, w) = if right >= left { (deck.right + gap, right - gap) } else { (wa.left, left - gap) };
-            if w < self.px(640) { continue } // no room beside the deck on this monitor: leave it
-            unsafe {
-                if IsZoomed(h) != 0 { ShowWindow(h, SW_SHOWNOACTIVATE); }
-                SetWindowPos(h, null_mut(), x, wa.top, w, wa.bottom - wa.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            if w >= self.px(640) {
+                unsafe {
+                    if IsZoomed(h) != 0 { ShowWindow(h, SW_SHOWNOACTIVATE); }
+                    SetWindowPos(h, null_mut(), x, wa.top, w, wa.bottom - wa.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            } else {
+                cover = true; // no room beside the deck on this monitor: stay over it instead
             }
         }
+        if cover && !self.topmost_setting() { self.raise() }
         let splash = studios.iter().any(|&h| process_windows(window_pid(h)).into_iter().any(|w| {
             (unsafe { GetWindowLongPtrW(w, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST) != 0 && overlaps(&rect(w), &deck)
         }));
-        if splash { self.set_top(true) }
+        if self.topmost_setting() { if splash { self.set_top(true) } return }
+        if splash != self.splash_top {
+            self.splash_top = splash;
+            self.set_top(splash);
+        }
+    }
+    // To the front of the normal windows without taking focus. A plain HWND_TOP is ignored while another app has the
+    // foreground; going topmost and straight back is not.
+    fn raise(&self) {
+        let f = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+        unsafe {
+            SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, f);
+            if !self.topmost_setting() && !self.splash_top { SetWindowPos(self.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, f); }
+        }
     }
     // Read from the window itself: Studio's activation can clear the bit behind our back.
     fn is_top(&self) -> bool { unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0 } }
@@ -1806,6 +1838,8 @@ impl App {
             self.animate();
         } else if let Some(i) = self.hit(x, y).filter(|&i| self.tiles[i].src == d.src) {
             let src = self.tiles[i].src;
+            // chosen on purpose: the deck stops coming back over this Studio
+            if let Some(seen) = self.seen.as_mut() { seen.insert(src as usize, 0); }
             unsafe {
                 if IsIconic(src) != 0 { ShowWindow(src, SW_RESTORE); }
                 SetForegroundWindow(src);
@@ -1822,6 +1856,7 @@ impl App {
                 for (k, v) in [("x", r.left), ("y", r.top), ("w", r.right - r.left), ("h", r.bottom - r.top)] { self.settings[k] = v.into() }
             }
         }
+        if unsafe { IsWindowVisible(self.hwnd) } != 0 && unsafe { IsIconic(self.hwnd) } == 0 { self.settings["max"] = (unsafe { IsZoomed(self.hwnd) } != 0).into() }
         self.settings["background"] = background_enabled().into(); // (toggled elsewhere: never overwrite it)
         let _ = std::fs::write(settings_path(), self.settings.to_string());
     }
@@ -2216,7 +2251,12 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 0
             }
             WM_TIMER => { a.tick(); 0 }
-            WM_SIZE => { a.layout(true); 0 }
+            WM_SIZE => {
+                // full screen on/off is remembered right away (the window can be killed before it hides)
+                if (wp == SIZE_MAXIMIZED as usize) != (a.settings["max"].as_bool() == Some(true)) && wp != SIZE_MINIMIZED as usize { a.save_settings() }
+                a.layout(true);
+                0
+            }
             WM_ERASEBKGND => 1,
             WM_PAINT => {
                 let mut ps: PAINTSTRUCT = zeroed();
@@ -2419,7 +2459,9 @@ fn main() {
             .unwrap_or_else(|| serde_json::json!({}));
         let r = initial_rect(&settings);
         let title = w("Studio Deck");
-        let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW, r.left, r.top,
+        // created maximised (still hidden) when it was full screen last time; showing it later keeps that
+        let max = if settings["max"].as_bool() == Some(true) { WS_MAXIMIZE } else { 0 };
+        let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW | max, r.left, r.top,
             r.right - r.left, r.bottom - r.top, null_mut(), null_mut(), inst, null());
         if hwnd.is_null() { return }
         // Dark title bar, rounded corners, Mica title bar (Win11; ignored on Win10).
@@ -2440,7 +2482,7 @@ fn main() {
             icon_face: pick_face(&["Segoe Fluent Icons", "Segoe MDL2 Assets"]), f_title: null_mut(), f_body: null_mut(), f_icon: null_mut(),
             card: (0.0, 0.0), slots: Vec::new(), drag: None, animating: false, last_frame: Instant::now(), settings,
             overlay, hot: None, hdr: 0, confirm: None, pc_mem: (0.0, 0.0), pending: Vec::new(), shown: force,
-            update: None, update_open: false, update_msg: String::new(), checking: false, uptodate_until: 0, seen: None, tip_want: None, tip: None, back: (null_mut(), 0, 0), groups: Vec::new(), zoom: None, collapsed: Default::default(),
+            update: None, update_open: false, update_msg: String::new(), checking: false, uptodate_until: 0, seen: None, splash_top: false, tip_want: None, tip: None, back: (null_mut(), 0, 0), groups: Vec::new(), zoom: None, collapsed: Default::default(),
             music: false, tracks: Vec::new(), tracks_at: None, mus_top: 0, playing: None, paused: false, scrub: None, mus_len: 0, mus_msg: None,
             grid: true, gal_top: 0, gallery: false, gal: gallery::list(), gal_i: 0, gal_seen: 0, thumbs: HashMap::new(), big: None, asked: Default::default(), gal_tx: gallery::worker(hwnd),
             trace: std::env::var_os("STUDIODECK_TRACE").and_then(|p| std::fs::File::create(p).ok()),
